@@ -1,2 +1,2 @@
 # smol-coder
-Extremely slow and efficient local coding harness
+Extremely smol and efficient local coding harness
