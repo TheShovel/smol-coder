@@ -244,6 +244,8 @@ Keys:
   Ctrl+N          Next open file
   Ctrl+W          Close the current file
   Ctrl+C          Copy the editor selection
+  Ctrl+X          Cut the editor selection
+  Ctrl+V          Paste into the editor or agent prompt
   Shift+arrows    Select text
   Tab             Accept a prediction or @ file suggestion, or indent
   BackTab         Dedent

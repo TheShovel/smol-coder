@@ -150,6 +150,7 @@ pub enum MenuAction {
     NextFile,
     PreviousFile,
     RefreshGit,
+    PushGit,
     ExplainFile,
     ReviewFile,
     ExplainSelection,
@@ -1296,10 +1297,13 @@ impl App {
                 self.send_rpc(command);
             }
             "copy" => match self.agent.last_assistant() {
-                Some(text) => match copy_to_clipboard(&text) {
-                    Ok(()) => self.set_status("copied"),
-                    Err(error) => self.agent.note(error),
-                },
+                Some(text) => {
+                    self.editor.clipboard = text.clone();
+                    match copy_to_clipboard(&text) {
+                        Ok(()) => self.set_status("copied"),
+                        Err(error) => self.agent.note(error),
+                    }
+                }
                 None => self.agent.note("nothing to copy"),
             },
             "hide" => self.set_agent_hidden(true),
@@ -1467,12 +1471,25 @@ impl App {
             if self.focus == Focus::Editor {
                 if let Some(text) = self.editor.selection_text() {
                     if !text.is_empty() {
-                        match copy_to_clipboard(&text) {
-                            Ok(()) => self.set_status("copied"),
-                            Err(error) => self.set_status(error),
-                        }
+                        self.copy_text(&text, "copied");
                     }
                 }
+            }
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('x') {
+            if self.focus == Focus::Editor {
+                if let Some(text) = self.editor.cut_selection() {
+                    self.copy_text(&text, "cut");
+                }
+            }
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('v') {
+            match self.focus {
+                Focus::Editor => self.paste_editor(),
+                Focus::Agent => self.paste_agent(),
+                Focus::Tree => {}
             }
             return;
         }
@@ -1611,7 +1628,7 @@ impl App {
                 submenu_item("Files", 4, MenuPageKind::Files),
                 submenu_item("Settings", 3, MenuPageKind::Settings),
                 submenu_item("LLM commands", 6, MenuPageKind::Llm),
-                submenu_item("Git", 1, MenuPageKind::Git),
+                submenu_item("Git", 2, MenuPageKind::Git),
                 MenuItem {
                     label: "Quit".to_string(),
                     hint: "ctrl+q".to_string(),
@@ -1721,11 +1738,18 @@ impl App {
                 kind: Some(MenuPageKind::Git),
                 title: "git",
                 selected: 0,
-                items: vec![MenuItem {
-                    label: "Refresh git status".to_string(),
-                    hint: "r".to_string(),
-                    action: MenuAction::RefreshGit,
-                }],
+                items: vec![
+                    MenuItem {
+                        label: "Refresh git status".to_string(),
+                        hint: "r".to_string(),
+                        action: MenuAction::RefreshGit,
+                    },
+                    MenuItem {
+                        label: "Push".to_string(),
+                        hint: "p".to_string(),
+                        action: MenuAction::PushGit,
+                    },
+                ],
             },
         }
     }
@@ -1809,6 +1833,7 @@ impl App {
                 self.git.refresh();
                 self.set_status("git status refreshed");
             }
+            MenuAction::PushGit => self.push_git(),
             MenuAction::ExplainFile => self.explain_file_with_pi(),
             MenuAction::ReviewFile => self.review_file_with_pi(),
             MenuAction::ExplainSelection => self.explain_selection_with_pi(),
@@ -2125,6 +2150,43 @@ impl App {
         match self.editor.save_active() {
             Ok(message) => self.set_status(message),
             Err(error) => self.set_status(error),
+        }
+    }
+
+    fn copy_text(&mut self, text: &str, action: &str) {
+        self.editor.clipboard = text.to_string();
+        match copy_to_clipboard(text) {
+            Ok(()) => self.set_status(action),
+            Err(_) => self.set_status(format!("{action} to app clipboard")),
+        }
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        clipboard_from_system()
+            .filter(|text| !text.is_empty())
+            .or_else(|| (!self.editor.clipboard.is_empty()).then(|| self.editor.clipboard.clone()))
+    }
+
+    fn paste_editor(&mut self) {
+        match self.clipboard_text() {
+            Some(text) => {
+                self.editor.insert_text(&text);
+                self.set_status("pasted");
+            }
+            None => self.set_status("clipboard is empty"),
+        }
+    }
+
+    fn paste_agent(&mut self) {
+        match self.clipboard_text() {
+            Some(text) => {
+                for ch in text.replace(['\r', '\n'], " ").chars() {
+                    self.agent.insert_input(ch);
+                }
+                self.refresh_agent_suggestions();
+                self.set_status("pasted");
+            }
+            None => self.set_status("clipboard is empty"),
         }
     }
 
@@ -2903,9 +2965,85 @@ fn diff_kind(line: &str) -> DiffKind {
     }
 }
 
+fn clipboard_from_system() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    const READERS: &[(&str, &[&str])] = &[
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+    ];
+    #[cfg(target_os = "macos")]
+    const READERS: &[(&str, &[&str])] = &[("pbpaste", &[])];
+    #[cfg(target_os = "windows")]
+    const READERS: &[(&str, &[&str])] = &[(
+        "powershell",
+        &["-NoProfile", "-Command", "Get-Clipboard -Raw"],
+    )];
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    const READERS: &[(&str, &[&str])] = &[];
+
+    for &(program, args) in READERS {
+        let Ok(output) = Command::new(program).args(args).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn write_system_clipboard(text: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    const WRITERS: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    #[cfg(target_os = "macos")]
+    const WRITERS: &[(&str, &[&str])] = &[("pbcopy", &[])];
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const WRITERS: &[(&str, &[&str])] = &[];
+
+    for &(program, args) in WRITERS {
+        let Ok(mut child) = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let Some(mut input) = child.stdin.take() else {
+            let _ = child.wait();
+            continue;
+        };
+        if input.write_all(text.as_bytes()).is_err() {
+            drop(input);
+            let _ = child.wait();
+            continue;
+        }
+        drop(input);
+        if child.wait().map(|status| status.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
     if text.len() > 100_000 {
         return Err("selection is too large to copy".into());
+    }
+    if write_system_clipboard(text) {
+        return Ok(());
     }
     let encoded = base64(text.as_bytes());
     let mut stdout = io::stdout();
@@ -2966,6 +3104,18 @@ mod tests {
 
     fn test_app() -> App {
         App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")), true)
+    }
+
+    #[test]
+    fn git_menu_includes_push() {
+        let page = test_app().menu_page(MenuPageKind::Git);
+        let push = page
+            .items
+            .iter()
+            .find(|item| matches!(item.action, MenuAction::PushGit))
+            .expect("git menu should include push");
+        assert_eq!(push.label, "Push");
+        assert_eq!(push.hint, "p");
     }
 
     #[test]

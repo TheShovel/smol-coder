@@ -101,6 +101,7 @@ pub struct Editor {
     pub active: usize,
     pub wrap: bool,
     pub ghost: Option<String>,
+    pub clipboard: String,
     predictor: Predictor,
     highlighter: Arc<Highlighter>,
     highlight_tx: Sender<HighlightResult>,
@@ -121,6 +122,7 @@ impl Editor {
             active: 0,
             wrap: true,
             ghost: None,
+            clipboard: String::new(),
             predictor: Predictor::load(),
             highlighter: Arc::new(Highlighter::new()),
             highlight_tx,
@@ -236,6 +238,25 @@ impl Editor {
                 text.push('\n');
             }
         }
+        Some(text)
+    }
+
+    pub fn cut_selection(&mut self) -> Option<String> {
+        let text = self.selection_text()?;
+        if text.is_empty() {
+            return None;
+        }
+        if let Some(buffer) = self.buffers.get_mut(self.active) {
+            buffer.remember(false);
+            buffer.dirty = true;
+            buffer.highlight_dirty = true;
+        }
+        self.delete_selection_internal();
+        if let Some(buffer) = self.buffers.get_mut(self.active) {
+            buffer.undo_group = None;
+        }
+        self.version += 1;
+        self.clear_prediction();
         Some(text)
     }
 
@@ -1182,6 +1203,38 @@ mod tests {
 
         assert!(editor.has_selection());
         assert_eq!(editor.selection_text().as_deref(), Some("bc\nde"));
+    }
+
+    #[test]
+    fn cut_removes_selection_and_allows_paste() {
+        let mut editor = Editor::new(Path::new("."));
+        editor.buffers.push(Buffer {
+            path: PathBuf::from("test.txt"),
+            rel: "test.txt".to_string(),
+            lines: vec!["hello world".to_string()],
+            cursor_line: 0,
+            cursor_col: 11,
+            scroll: 0,
+            hscroll: 0,
+            selection: Some((0, 6)),
+            dirty: false,
+            external_change: false,
+            highlight_dirty: false,
+            spans: Vec::new(),
+            undo: Vec::new(),
+            undo_group: None,
+        });
+        editor.active = 0;
+
+        assert_eq!(editor.cut_selection().as_deref(), Some("world"));
+        let buffer = editor.buffer().unwrap();
+        assert_eq!(buffer.lines[0], "hello ");
+        assert_eq!(buffer.cursor_col, 6);
+        assert!(buffer.dirty);
+        assert!(buffer.selection.is_none());
+
+        editor.insert_text("there");
+        assert_eq!(editor.buffer().unwrap().lines[0], "hello there");
     }
 
     #[test]

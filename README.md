@@ -42,6 +42,8 @@ Run `smol --help` for all options.
 | `Ctrl+Z` | Undo |
 | `Ctrl+Q` | Quit |
 | `Ctrl+C` | Copy selection |
+| `Ctrl+X` | Cut selection |
+| `Ctrl+V` | Paste into the editor or agent prompt |
 | `Ctrl+N` | Next file |
 | `Ctrl+P` | Command menu and settings |
 | `Ctrl+W` | Close file |
@@ -53,11 +55,11 @@ Run `smol --help` for all options.
 | `Enter` | Open a file or diff, send a prompt, or commit |
 | `Esc` | Stop the agent, close a diff, or leave the git input |
 
-The file tree also supports arrows and `h`, `j`, `k`, `l`. It refreshes automatically when files and folders change. Click files and folders, drag pane dividers to resize, and drag in the editor to select text. Copy uses the terminal's OSC 52 clipboard support.
+The file tree also supports arrows and `h`, `j`, `k`, `l`. It refreshes automatically when files and folders change. Click files and folders, drag pane dividers to resize, and drag in the editor to select text. Cut and copy use the local clipboard tool when available, otherwise the terminal's OSC 52 clipboard support; paste reads the system clipboard and falls back to text cut or copied in smol.
 
 Type `@` in the agent input to reference a project file. A list filters paths as you type; use Up/Down and Tab or Enter to insert one.
 
-The command menu groups actions into `Files`, `Settings`, `LLM commands`, and `Git` submenus.
+The command menu groups actions into `Files`, `Settings`, `LLM commands`, and `Git` submenus. The `Git` submenu refreshes status and pushes.
 
 ## pi
 
