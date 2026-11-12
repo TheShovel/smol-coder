@@ -211,6 +211,7 @@ Keys:
   Ctrl+Z          Undo the last edit
   Ctrl+Q          Quit
   Ctrl+P          Open the command menu
+  Ctrl+R          Open the session history
   Ctrl+N          Next open file
   Ctrl+W          Close the current file
   Ctrl+C          Copy the editor selection
@@ -232,6 +233,7 @@ Mouse:
 Agent commands:
   /help           List commands and pi resources
   /new            Start a new session
+  /history        Resume or delete a saved session
   /compact        Compact context
   /model          List or switch models
   /thinking       Show or set the thinking level
@@ -246,6 +248,7 @@ Git sidebar:
   d               Discard the selected change, press twice to confirm
   r               Refresh status
   Enter           Open the selected diff
+  Esc             Close the open diff
   o               Open the selected file",
         env!("CARGO_PKG_VERSION")
     );

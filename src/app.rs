@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -95,8 +96,11 @@ pub struct UiRects {
     pub agent: Rect,
     pub agent_input: Rect,
     pub agent_thinking: Vec<(Rect, usize)>,
+    pub diff_header: Rect,
     pub status: Rect,
     pub context_menu: Rect,
+    pub history: Rect,
+    pub history_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -174,6 +178,7 @@ pub enum MenuAction {
     RefactorSelection,
     AddTests,
     FormatFile,
+    SessionHistory,
     Quit,
 }
 
@@ -317,6 +322,50 @@ fn submenu_item(label: &str, count: usize, kind: MenuPageKind) -> MenuItem {
 pub struct PiCommand {
     pub name: String,
     pub description: String,
+}
+
+#[derive(Clone)]
+pub struct SessionInfo {
+    pub path: PathBuf,
+    pub cwd: String,
+    pub name: Option<String>,
+    pub first_message: String,
+    pub message_count: usize,
+    pub modified: SystemTime,
+}
+
+impl SessionInfo {
+    pub fn label(&self) -> String {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
+        let first = self.first_message.lines().next().unwrap_or_default().trim();
+        if first.is_empty() {
+            "(empty session)".to_string()
+        } else {
+            first.to_string()
+        }
+    }
+
+    pub fn age(&self) -> String {
+        let seconds = SystemTime::now()
+            .duration_since(self.modified)
+            .unwrap_or_default()
+            .as_secs();
+        match seconds {
+            0..=59 => "now".to_string(),
+            60..=3_599 => format!("{}m", seconds / 60),
+            3_600..=86_399 => format!("{}h", seconds / 3_600),
+            86_400..=604_799 => format!("{}d", seconds / 86_400),
+            _ => format!("{}w", seconds / 604_800),
+        }
+    }
+}
+
+pub struct SessionHistory {
+    pub sessions: Vec<SessionInfo>,
+    pub selected: usize,
+    pub confirm: Option<PathBuf>,
 }
 
 pub struct Agent {
@@ -668,6 +717,9 @@ pub struct App {
     pub diff: Option<DiffView>,
     pub menu: Option<CommandMenu>,
     pub context_menu: Option<ContextMenu>,
+    pub history: Option<SessionHistory>,
+    pub session_path: Option<PathBuf>,
+    pub session_dir: Option<PathBuf>,
     pub dialog: Option<FileDialog>,
     pub unsupported: Option<PathBuf>,
     pub dragging: bool,
@@ -687,6 +739,7 @@ pub struct App {
     stats_notice: bool,
     auto_compacted: bool,
     pending: HashMap<String, PendingTool>,
+    pending_switch: Option<PathBuf>,
     pi_stderr: Vec<String>,
     pi_exited: bool,
     project_lines: Option<Receiver<Vec<String>>>,
@@ -746,6 +799,9 @@ impl App {
             diff: None,
             menu: None,
             context_menu: None,
+            history: None,
+            session_path: None,
+            session_dir: None,
             dialog: None,
             unsupported: None,
             dragging: false,
@@ -765,6 +821,7 @@ impl App {
             stats_notice: false,
             auto_compacted: false,
             pending: HashMap::new(),
+            pending_switch: None,
             pi_stderr: Vec::new(),
             pi_exited: false,
             project_lines,
@@ -939,6 +996,9 @@ impl App {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("request failed");
+            if command == "switch_session" {
+                self.pending_switch = None;
+            }
             if command != "set_auto_compaction" {
                 self.agent.note(format!("{command}: {error}"));
             }
@@ -960,6 +1020,9 @@ impl App {
                 if let Some(streaming) = value.pointer("/data/isStreaming").and_then(Value::as_bool)
                 {
                     self.agent.busy = streaming;
+                }
+                if let Some(path) = value.pointer("/data/sessionFile").and_then(Value::as_str) {
+                    self.remember_session(path);
                 }
             }
             "get_commands" => {
@@ -1007,6 +1070,31 @@ impl App {
                 self.context_percent = None;
                 self.auto_compacted = false;
                 self.set_status("new session");
+                self.send_rpc(json!({ "type": "get_state" }));
+            }
+            "switch_session" => {
+                let cancelled = value
+                    .pointer("/data/cancelled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let path = self.pending_switch.take();
+                if cancelled {
+                    self.set_status("session switch cancelled");
+                } else if let Some(path) = path {
+                    self.remember_session_path(&path);
+                    self.agent.reset();
+                    self.context_percent = None;
+                    self.auto_compacted = false;
+                    self.set_status("loading session");
+                    self.send_rpc(json!({ "type": "get_messages" }));
+                    self.send_rpc(json!({ "type": "get_state" }));
+                    self.send_rpc(json!({ "type": "get_session_stats" }));
+                }
+            }
+            "get_messages" => {
+                if let Some(messages) = value.pointer("/data/messages").and_then(Value::as_array) {
+                    self.load_transcript(messages);
+                }
             }
             "set_thinking_level" => {
                 if let Some(level) = value.pointer("/data/level").and_then(Value::as_str) {
@@ -1014,6 +1102,9 @@ impl App {
                 }
             }
             "get_session_stats" => {
+                if let Some(path) = value.pointer("/data/sessionFile").and_then(Value::as_str) {
+                    self.remember_session(path);
+                }
                 let percent = value
                     .pointer("/data/contextUsage/percent")
                     .and_then(Value::as_u64);
@@ -1410,6 +1501,305 @@ impl App {
         }
     }
 
+    fn remember_session(&mut self, path: &str) {
+        self.remember_session_path(&PathBuf::from(path));
+    }
+
+    fn remember_session_path(&mut self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.session_dir = Some(parent.to_path_buf());
+        }
+        self.session_path = Some(path.to_path_buf());
+    }
+
+    fn sessions_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.session_dir {
+            return dir.clone();
+        }
+        if let Some(path) = &self.session_path {
+            if let Some(parent) = path.parent() {
+                return parent.to_path_buf();
+            }
+        }
+        if let Some(dir) = env::var_os("PI_CODING_AGENT_SESSION_DIR") {
+            return PathBuf::from(dir);
+        }
+        let agent_dir = env::var_os("PI_CODING_AGENT_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("HOME")
+                    .or_else(|| env::var_os("USERPROFILE"))
+                    .map(|home| PathBuf::from(home).join(".pi").join("agent"))
+            })
+            .unwrap_or_else(|| PathBuf::from(".pi").join("agent"));
+        let cwd = self.root.to_string_lossy();
+        let safe = cwd
+            .trim_start_matches(['/', '\\'])
+            .replace(['/', '\\', ':'], "-");
+        agent_dir.join("sessions").join(format!("--{safe}--"))
+    }
+
+    fn open_history(&mut self) {
+        if self.agent.busy {
+            self.set_status("stop the agent before opening history");
+            return;
+        }
+        let sessions = list_sessions(&self.sessions_dir(), &self.root);
+        let selected = sessions
+            .iter()
+            .position(|session| self.session_path.as_ref() == Some(&session.path))
+            .unwrap_or(0);
+        self.menu = None;
+        self.context_menu = None;
+        self.dialog = None;
+        self.history = Some(SessionHistory {
+            sessions,
+            selected,
+            confirm: None,
+        });
+    }
+
+    fn refresh_history(&mut self) {
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        let selected = history.selected;
+        let confirm = history.confirm.clone();
+        let sessions = list_sessions(&self.sessions_dir(), &self.root);
+        if let Some(history) = self.history.as_mut() {
+            history.sessions = sessions;
+            history.selected = selected.min(history.sessions.len().saturating_sub(1));
+            if confirm.is_some_and(|path| {
+                !history.sessions.iter().any(|session| session.path == path)
+            }) {
+                history.confirm = None;
+            }
+        }
+    }
+
+    fn resume_session(&mut self, path: PathBuf) {
+        if self.agent.busy {
+            self.set_status("stop the agent before switching sessions");
+            return;
+        }
+        if !self.ensure_pi() {
+            return;
+        }
+        self.pending_switch = Some(path.clone());
+        self.history = None;
+        self.set_status("loading session");
+        self.send_rpc(json!({
+            "type": "switch_session",
+            "sessionPath": path.to_string_lossy().to_string()
+        }));
+    }
+
+    fn delete_session(&mut self, path: PathBuf) {
+        let active = self.session_path.as_deref() == Some(path.as_path());
+        if active {
+            self.send_rpc(json!({ "type": "new_session" }));
+            self.agent.reset();
+            self.context_percent = None;
+            self.auto_compacted = false;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(history) = self.history.as_mut() {
+                    history.sessions.retain(|session| session.path != path);
+                    history.selected =
+                        history.selected.min(history.sessions.len().saturating_sub(1));
+                    history.confirm = None;
+                }
+                self.set_status("deleted session");
+            }
+            Err(error) => {
+                if let Some(history) = self.history.as_mut() {
+                    history.confirm = None;
+                }
+                self.set_status(format!("delete failed: {error}"));
+            }
+        }
+    }
+
+    fn handle_history_key(&mut self, key: KeyEvent) {
+        let mut close = false;
+        let mut refresh = false;
+        let mut resume = None;
+        let mut delete = None;
+        let mut confirm = false;
+        if let Some(history) = self.history.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    if history.confirm.take().is_none() {
+                        close = true;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    history.selected = history.selected.saturating_sub(1);
+                    history.confirm = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    history.selected = (history.selected + 1)
+                        .min(history.sessions.len().saturating_sub(1));
+                    history.confirm = None;
+                }
+                KeyCode::Home => {
+                    history.selected = 0;
+                    history.confirm = None;
+                }
+                KeyCode::End => {
+                    history.selected = history.sessions.len().saturating_sub(1);
+                    history.confirm = None;
+                }
+                KeyCode::PageUp => {
+                    history.selected = history.selected.saturating_sub(8);
+                    history.confirm = None;
+                }
+                KeyCode::PageDown => {
+                    history.selected = (history.selected + 8)
+                        .min(history.sessions.len().saturating_sub(1));
+                    history.confirm = None;
+                }
+                KeyCode::Char('r') => refresh = true,
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    if let Some(session) = history.sessions.get(history.selected) {
+                        let path = session.path.clone();
+                        if history.confirm.as_deref() == Some(path.as_path()) {
+                            delete = Some(path);
+                        } else {
+                            history.confirm = Some(path);
+                            confirm = true;
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(path) = history.confirm.clone() {
+                        delete = Some(path);
+                    } else if let Some(session) = history.sessions.get(history.selected) {
+                        resume = Some(session.path.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close {
+            self.history = None;
+        } else if refresh {
+            self.refresh_history();
+        } else if let Some(path) = delete {
+            self.delete_session(path);
+        } else if let Some(path) = resume {
+            self.resume_session(path);
+        } else if confirm {
+            self.set_status("press d or enter to delete");
+        }
+    }
+
+    fn load_transcript(&mut self, messages: &[Value]) {
+        self.agent.reset();
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match role {
+                "user" => {
+                    let text = message_text(message);
+                    if !text.trim().is_empty() {
+                        self.agent.entries.push(Entry::User(text));
+                    }
+                }
+                "assistant" => {
+                    let mut text = String::new();
+                    let mut thinking = String::new();
+                    let mut calls = Vec::new();
+                    if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+                        for block in blocks {
+                            match block.get("type").and_then(Value::as_str) {
+                                Some("text") => {
+                                    if let Some(part) =
+                                        block.get("text").and_then(Value::as_str)
+                                    {
+                                        if !text.is_empty() {
+                                            text.push('\n');
+                                        }
+                                        text.push_str(part);
+                                    }
+                                }
+                                Some("thinking") => {
+                                    if let Some(part) =
+                                        block.get("thinking").and_then(Value::as_str)
+                                    {
+                                        if !thinking.is_empty() {
+                                            thinking.push('\n');
+                                        }
+                                        thinking.push_str(part);
+                                    }
+                                }
+                                Some("toolCall") => {
+                                    let id = block
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let name = block
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("tool")
+                                        .to_string();
+                                    let args =
+                                        block.get("arguments").cloned().unwrap_or(Value::Null);
+                                    calls.push((id, name, args));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if !text.trim().is_empty() || !thinking.trim().is_empty() {
+                        self.agent.entries.push(Entry::Assistant {
+                            text,
+                            thinking,
+                            thinking_open: false,
+                        });
+                    }
+                    for (id, name, args) in calls {
+                        let path = tool_path(&args).map(|raw| self.resolve(&raw));
+                        let label = tool_label(&name, &args, path.as_deref(), &self.root);
+                        let body = tool_body(&name, &args);
+                        self.agent.push_tool(&id, label, ToolState::Running, body);
+                    }
+                }
+                "toolResult" => {
+                    let id = message
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let failed = message
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    self.agent.update_tool(
+                        id,
+                        if failed {
+                            ToolState::Failed
+                        } else {
+                            ToolState::Done
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+        for entry in &mut self.agent.entries {
+            if let Entry::Tool(tool) = entry {
+                if tool.state == ToolState::Running {
+                    tool.state = ToolState::Done;
+                }
+            }
+        }
+        self.agent.scroll = 0;
+    }
+
     fn handle_agent_command(&mut self, text: &str) {
         let Some(body) = text.strip_prefix('/') else {
             return;
@@ -1428,6 +1818,7 @@ impl App {
                 self.agent.note(help);
             }
             "new" | "reset" => self.send_rpc(json!({ "type": "new_session" })),
+            "history" | "resume" => self.open_history(),
             "compact" => {
                 let mut command = json!({ "type": "compact" });
                 if !args.is_empty() {
@@ -1537,7 +1928,7 @@ impl App {
 
     fn command_help(&self) -> String {
         let mut text = String::from(
-            "commands\n/help  /new  /compact [instructions]  /model [provider/model]  /thinking [level]\n/abort  /stats  /name [name]  /export [path]  /copy  /hide  /show\n",
+            "commands\n/help  /new  /history  /compact [instructions]  /model [provider/model]  /thinking [level]\n/abort  /stats  /name [name]  /export [path]  /copy  /hide  /show\n",
         );
         if !self.commands.is_empty() {
             text.push_str("\npi resources\n");
@@ -1551,7 +1942,7 @@ impl App {
             }
         }
         text.push_str(
-            "\n/settings /resume /tree /fork /clone /share /login run inside pi's terminal",
+            "\n/settings /tree /fork /clone /share /login run inside pi's terminal",
         );
         text
     }
@@ -1579,6 +1970,10 @@ impl App {
             self.handle_dialog_key(key, ctrl, alt);
             return;
         }
+        if self.history.is_some() {
+            self.handle_history_key(key);
+            return;
+        }
         if self.context_menu.is_some() {
             self.handle_context_key(key);
             return;
@@ -1591,24 +1986,8 @@ impl App {
             self.handle_menu_key(key);
             return;
         }
-        if self.diff.is_some() {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                self.diff = None;
-                return;
-            }
-            if let Some(diff) = &mut self.diff {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => diff.scroll = diff.scroll.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        diff.scroll = diff.scroll.saturating_add(1)
-                    }
-                    KeyCode::PageUp => diff.scroll = diff.scroll.saturating_sub(10),
-                    KeyCode::PageDown => diff.scroll = diff.scroll.saturating_add(10),
-                    KeyCode::Home => diff.scroll = 0,
-                    KeyCode::End => diff.scroll = diff.lines.len().saturating_sub(1),
-                    _ => {}
-                }
-            }
+        if ctrl && key.code == KeyCode::Char('r') {
+            self.open_history();
             return;
         }
         if key.code == KeyCode::F(6) {
@@ -1643,7 +2022,8 @@ impl App {
             return;
         }
         if ctrl && key.code == KeyCode::Char('x') {
-            if self.focus == Focus::Editor {
+            // The diff covers the editor, so cutting would edit blind.
+            if self.focus == Focus::Editor && self.diff.is_none() {
                 if let Some(text) = self.editor.cut_selection() {
                     self.copy_text(&text, "cut");
                 }
@@ -1652,9 +2032,9 @@ impl App {
         }
         if ctrl && key.code == KeyCode::Char('v') {
             match self.focus {
-                Focus::Editor => self.paste_editor(),
+                Focus::Editor if self.diff.is_none() => self.paste_editor(),
                 Focus::Agent => self.paste_agent(),
-                Focus::Tree => {}
+                _ => {}
             }
             return;
         }
@@ -1677,10 +2057,66 @@ impl App {
             }
         }
 
+        if self.diff.is_some() && self.handle_diff_key(key) {
+            return;
+        }
+
         match self.focus {
             Focus::Tree => self.handle_sidebar_key(key, ctrl, alt),
             Focus::Editor => self.handle_editor_key(key, ctrl, alt),
             Focus::Agent => self.handle_agent_key(key, ctrl, alt),
+        }
+    }
+
+    /// Returns true when the open diff view consumed the key.
+    ///
+    /// The diff only takes over the keys of the pane it replaces, the editor.
+    /// The sidebar, a focused commit input, and the agent prompt keep their
+    /// keys, so a diff can never block browsing changes, committing, or typing
+    /// a prompt.
+    fn handle_diff_key(&mut self, key: KeyEvent) -> bool {
+        let prompt_owns_keys = match self.focus {
+            Focus::Editor => false,
+            Focus::Tree => self.git.input_focus,
+            Focus::Agent => true,
+        };
+
+        match key.code {
+            // Esc closes the diff, except while the agent needs it to stop a
+            // run or to close the file suggestions.
+            KeyCode::Esc => {
+                if self.focus == Focus::Agent
+                    && (self.agent.busy || !self.agent.suggestions.is_empty())
+                {
+                    return false;
+                }
+                self.diff = None;
+                true
+            }
+            KeyCode::Char('q') if !prompt_owns_keys => {
+                self.diff = None;
+                true
+            }
+            // The editor is covered by the diff, so its keys would edit blind.
+            _ if self.focus == Focus::Editor => {
+                if let Some(diff) = &mut self.diff {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            diff.scroll = diff.scroll.saturating_sub(1)
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            diff.scroll = diff.scroll.saturating_add(1)
+                        }
+                        KeyCode::PageUp => diff.scroll = diff.scroll.saturating_sub(10),
+                        KeyCode::PageDown => diff.scroll = diff.scroll.saturating_add(10),
+                        KeyCode::Home => diff.scroll = 0,
+                        KeyCode::End => diff.scroll = diff.lines.len().saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1748,7 +2184,10 @@ impl App {
             return;
         }
         match self.git.commit() {
-            Ok(message) => self.set_status(message),
+            Ok(message) => {
+                self.diff = None;
+                self.set_status(message);
+            }
             Err(error) => self.set_status(error),
         }
     }
@@ -1791,7 +2230,7 @@ impl App {
             selected: 0,
             items: vec![
                 submenu_item("Files", 4, MenuPageKind::Files),
-                submenu_item("Settings", 4, MenuPageKind::Settings),
+                submenu_item("Settings", 5, MenuPageKind::Settings),
                 submenu_item("LLM commands", 6, MenuPageKind::Llm),
                 submenu_item("Git", 2, MenuPageKind::Git),
                 MenuItem {
@@ -1858,6 +2297,11 @@ impl App {
                             label: "Sidebar".to_string(),
                             hint: sidebar.to_string(),
                             action: MenuAction::ToggleGit,
+                        },
+                        MenuItem {
+                            label: "Session history".to_string(),
+                            hint: "ctrl+r".to_string(),
+                            action: MenuAction::SessionHistory,
                         },
                     ],
                 }
@@ -2005,6 +2449,7 @@ impl App {
             MenuAction::RefactorSelection => self.refactor_selection_with_pi(),
             MenuAction::AddTests => self.add_tests_with_pi(),
             MenuAction::FormatFile => self.format_file_with_pi(),
+            MenuAction::SessionHistory => self.open_history(),
             MenuAction::Quit => self.should_quit = true,
         }
         if keep_open {
@@ -2489,6 +2934,7 @@ impl App {
         }
         match self.git.discard_selected() {
             Ok((message, path)) => {
+                self.diff = None;
                 self.set_status(message);
                 self.reload_after_tool(&path);
                 self.refresh_tree();
@@ -2688,6 +3134,14 @@ impl App {
             }
             .to_string();
         }
+        if let Some(history) = &self.history {
+            return if history.confirm.is_some() {
+                "enter or d delete  esc cancel"
+            } else {
+                "enter resume  d delete  r refresh  esc close"
+            }
+            .to_string();
+        }
         if self.context_menu.is_some() {
             return "up/down select  enter run  esc close".to_string();
         }
@@ -2699,7 +3153,7 @@ impl App {
             }
             .to_string();
         }
-        if self.diff.is_some() {
+        if self.diff.is_some() && self.focus == Focus::Editor {
             return "j/k scroll  esc close".to_string();
         }
         if self.unsupported.is_some() {
@@ -2711,6 +3165,7 @@ impl App {
             .to_string();
         }
 
+        let diff_open = self.diff.is_some();
         let sidebar_toggle = if self.sidebar == Sidebar::Git {
             "ctrl+g files"
         } else {
@@ -2725,20 +3180,37 @@ impl App {
         if self.focus == Focus::Tree {
             return match self.sidebar {
                 Sidebar::Git if self.git.input_focus => {
-                    if full {
-                        "enter commit  esc cancel"
+                    if diff_open {
+                        "enter commit  esc close".to_string()
+                    } else if full {
+                        "enter commit  esc cancel".to_string()
                     } else {
-                        "enter commit"
+                        "enter commit".to_string()
                     }
                 }
                 Sidebar::Git => {
-                    if full {
+                    if diff_open {
+                        if full {
+                            "enter open  esc close  c commit  p push  d discard  r refresh  ctrl+g files"
+                        } else {
+                            "enter open  esc close  c commit  p push  d discard"
+                        }
+                    } else if full {
                         "enter diff  o open  c commit  p push  d discard  r refresh  ctrl+g files"
                     } else {
                         "enter diff  c commit  p push  d discard  ctrl+g files"
                     }
+                    .to_string()
                 }
                 Sidebar::Files => {
+                    if diff_open {
+                        if full {
+                            return format!(
+                                "enter open  esc close  h/l fold  {sidebar_toggle}  {agent_toggle}  ctrl+q quit"
+                            );
+                        }
+                        return format!("enter open  esc close  {sidebar_toggle}  ctrl+q quit");
+                    }
                     if full {
                         return format!(
                             "enter open  right-click menu  h/l fold  {sidebar_toggle}  {agent_toggle}  ctrl+q quit"
@@ -2768,7 +3240,11 @@ impl App {
                     }
                 }
                 PiState::Running(_) => {
-                    if full {
+                    if diff_open && full {
+                        "enter send  esc close diff  /help commands  ctrl+b hide"
+                    } else if diff_open {
+                        "enter send  esc close diff  ctrl+b hide"
+                    } else if full {
                         "enter send  /help commands  ctrl+b hide"
                     } else {
                         "enter send  ctrl+b hide"
@@ -2871,6 +3347,9 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.diff.is_some() && self.focus == Focus::Editor {
+            return;
+        }
         match self.focus {
             Focus::Editor => self.editor.insert_text(text),
             Focus::Agent => {
@@ -2889,6 +3368,42 @@ impl App {
         let y = mouse.row;
         self.hover = Some((x, y));
         if self.dialog.is_some() {
+            return;
+        }
+        if self.history.is_some() {
+            self.refresh_hover();
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let row = self
+                        .ui
+                        .history_rows
+                        .iter()
+                        .find(|(rect, _)| inside(*rect, x, y))
+                        .map(|(_, index)| *index);
+                    if let Some(index) = row {
+                        if let Some(history) = &mut self.history {
+                            history.selected = index;
+                            history.confirm = None;
+                        }
+                    } else if !inside(self.ui.history, x, y) {
+                        self.history = None;
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Some(history) = &mut self.history {
+                        history.selected = history.selected.saturating_sub(1);
+                        history.confirm = None;
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(history) = &mut self.history {
+                        history.selected = (history.selected + 1)
+                            .min(history.sessions.len().saturating_sub(1));
+                        history.confirm = None;
+                    }
+                }
+                _ => {}
+            }
             return;
         }
         if self.context_menu.is_some() {
@@ -2961,25 +3476,27 @@ impl App {
         }
         self.refresh_hover();
 
-        if self.diff.is_some() {
-            let in_editor = inside(self.ui.editor_text, x, y);
+        // The diff only owns clicks inside the editor pane. Clicks in the
+        // sidebar, the agent pane, or on a divider behave as usual.
+        if self.diff.is_some() && inside(self.ui.editor, x, y) {
             match mouse.kind {
-                MouseEventKind::ScrollUp if in_editor => {
+                MouseEventKind::ScrollUp => {
                     if let Some(diff) = &mut self.diff {
                         diff.scroll = diff.scroll.saturating_sub(3);
                     }
-                    return;
                 }
-                MouseEventKind::ScrollDown if in_editor => {
+                MouseEventKind::ScrollDown => {
                     if let Some(diff) = &mut self.diff {
                         diff.scroll = diff.scroll.saturating_add(3);
                     }
-                    return;
                 }
-                MouseEventKind::Down(MouseButton::Left) if inside(self.ui.tree, x, y) => {}
-                MouseEventKind::Down(MouseButton::Right) if inside(self.ui.tree, x, y) => {}
-                _ => return,
+                MouseEventKind::Down(MouseButton::Left) if inside(self.ui.diff_header, x, y) => {
+                    self.diff = None;
+                    self.set_status("diff closed");
+                }
+                _ => {}
             }
+            return;
         }
 
         match mouse.kind {
@@ -3135,6 +3652,21 @@ impl App {
             return;
         }
 
+        if self.history.is_some() {
+            self.hover_edge = None;
+            let over_row = self
+                .ui
+                .history_rows
+                .iter()
+                .any(|(rect, _)| inside(*rect, x, y));
+            self.set_pointer(if over_row {
+                PointerShape::Pointer
+            } else {
+                PointerShape::Default
+            });
+            return;
+        }
+
         if self.context_menu.is_some() {
             self.hover_edge = None;
             let rect = self.ui.context_menu;
@@ -3154,17 +3686,15 @@ impl App {
             return;
         }
 
-        if self.diff.is_some() {
+        if self.diff.is_some() && inside(self.ui.editor, x, y) {
+            // Inside the diff only the title is clickable.
             self.hover_edge = None;
-            let over_row = match self.sidebar {
-                Sidebar::Files => self.tree_hover_row(x, y).is_some(),
-                Sidebar::Git => self.git_hover_row(x, y).is_some(),
-            };
-            if over_row {
-                self.set_pointer(PointerShape::Pointer);
+            let over_header = inside(self.ui.diff_header, x, y);
+            self.set_pointer(if over_header {
+                PointerShape::Pointer
             } else {
-                self.set_pointer(PointerShape::Default);
-            }
+                PointerShape::Default
+            });
             return;
         }
 
@@ -3809,6 +4339,112 @@ fn message_text(message: &Value) -> String {
     }
 }
 
+fn list_sessions(dir: &Path, cwd: &Path) -> Vec<SessionInfo> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(PathBuf, SystemTime)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        })
+        .filter_map(|entry| {
+            let path = entry.path();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((path, modified))
+        })
+        .collect();
+    files.sort_by_key(|file| std::cmp::Reverse(file.1));
+    files.truncate(200);
+    files
+        .into_iter()
+        .filter_map(|(path, modified)| read_session_info(&path, modified))
+        .filter(|session| {
+            session.cwd.is_empty() || same_path(Path::new(&session.cwd), cwd)
+        })
+        .collect()
+}
+
+fn read_session_info(path: &Path, modified: SystemTime) -> Option<SessionInfo> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut header: Option<String> = None;
+    let mut name = None;
+    let mut message_count = 0;
+    let mut first_message = String::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if header.is_none() {
+            if kind == "session" {
+                header = Some(
+                    value
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+            continue;
+        }
+        match kind {
+            "session_info" => {
+                name = value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string);
+            }
+            "message" => {
+                message_count += 1;
+                if first_message.is_empty() {
+                    if let Some(message) = value.get("message") {
+                        if message.get("role").and_then(Value::as_str) == Some("user") {
+                            let text = message_text(message);
+                            if !text.trim().is_empty() {
+                                first_message = text;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(SessionInfo {
+        path: path.to_path_buf(),
+        cwd: header?,
+        name,
+        first_message,
+        message_count,
+        modified,
+    })
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4237,5 +4873,400 @@ mod tests {
         assert_eq!(app.agent.input, "inspect @src/app.rs ");
         assert_eq!(app.agent.input_cursor, app.agent.input.chars().count());
         assert!(app.agent.suggestions.is_empty());
+    }
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+        root
+    }
+
+    fn write_session(dir: &Path, file: &str, cwd: &Path, name: Option<&str>) -> PathBuf {
+        fs::create_dir_all(dir).expect("create session dir");
+        let path = dir.join(file);
+        let mut content = String::new();
+        content.push_str(
+            &json!({
+                "type": "session",
+                "version": 3,
+                "id": "session-id",
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "cwd": cwd.to_string_lossy().to_string()
+            })
+            .to_string(),
+        );
+        content.push('\n');
+        if let Some(name) = name {
+            content.push_str(
+                &json!({
+                    "type": "session_info",
+                    "id": "name-id",
+                    "parentId": null,
+                    "timestamp": "2026-01-01T00:00:01.000Z",
+                    "name": name
+                })
+                .to_string(),
+            );
+            content.push('\n');
+        }
+        for (id, role, text) in [
+            ("m1", "user", Some("first prompt")),
+            ("m2", "assistant", Some("the reply")),
+            ("m3", "toolResult", None),
+        ] {
+            let mut message = json!({ "role": role, "timestamp": 1 });
+            match (role, text) {
+                ("user", Some(text)) | ("assistant", Some(text)) => {
+                    message["content"] = json!([{ "type": "text", "text": text }]);
+                }
+                ("toolResult", _) => {
+                    message["toolCallId"] = json!("call-1");
+                    message["toolName"] = json!("bash");
+                    message["isError"] = json!(false);
+                    message["content"] = json!([]);
+                }
+                _ => {}
+            }
+            content.push_str(
+                &json!({
+                    "type": "message",
+                    "id": id,
+                    "parentId": null,
+                    "timestamp": "2026-01-01T00:00:02.000Z",
+                    "message": message
+                })
+                .to_string(),
+            );
+            content.push('\n');
+        }
+        fs::write(&path, content).expect("write session");
+        path
+    }
+
+    #[test]
+    fn session_history_lists_named_sessions_for_this_project() {
+        let root = temp_root("smol-session-list");
+        let dir = root.join("sessions");
+        let file = write_session(&dir, "one.jsonl", &root, Some("my work"));
+        write_session(&dir, "other.jsonl", Path::new("/some/other/project"), None);
+
+        let sessions = list_sessions(&dir, &root);
+        assert_eq!(sessions.len(), 1);
+        let session = sessions.first().expect("session");
+        assert_eq!(session.path, file);
+        assert_eq!(session.name.as_deref(), Some("my work"));
+        assert_eq!(session.message_count, 3);
+        assert_eq!(session.first_message, "first prompt");
+        assert_eq!(session.label(), "my work");
+        assert!(!session.age().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_history_rebuilds_transcript_from_messages() {
+        let mut app = test_app();
+        let messages = json!([
+            { "role": "user", "content": [{ "type": "text", "text": "question" }] },
+            {
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "plan" },
+                    {
+                        "type": "toolCall",
+                        "id": "call-1",
+                        "name": "bash",
+                        "arguments": { "command": "ls" }
+                    }
+                ]
+            },
+            {
+                "role": "toolResult",
+                "toolCallId": "call-1",
+                "toolName": "bash",
+                "isError": true,
+                "content": []
+            },
+            { "role": "assistant", "content": [{ "type": "text", "text": "answer" }] }
+        ]);
+        app.load_transcript(messages.as_array().expect("messages"));
+
+        assert!(matches!(
+            app.agent.entries.first(),
+            Some(Entry::User(text)) if text == "question"
+        ));
+        assert!(matches!(
+            app.agent.entries.get(1),
+            Some(Entry::Assistant { text, thinking, .. })
+                if text.is_empty() && thinking == "plan"
+        ));
+        assert!(matches!(
+            app.agent.entries.get(2),
+            Some(Entry::Tool(tool)) if tool.state == ToolState::Failed
+        ));
+        assert!(matches!(
+            app.agent.entries.get(3),
+            Some(Entry::Assistant { text, .. }) if text == "answer"
+        ));
+        assert_eq!(app.agent.entries.len(), 4);
+    }
+
+    #[test]
+    fn history_keys_resume_and_delete_sessions() {
+        let root = temp_root("smol-session-history");
+        let mut app = App::new(root.clone(), true);
+        let dir = root.join("sessions");
+        let file = write_session(&dir, "one.jsonl", &root, Some("work"));
+        app.session_dir = Some(dir.clone());
+        app.open_history();
+
+        let history = app.history.as_ref().expect("history open");
+        assert_eq!(history.sessions.len(), 1);
+        assert_eq!(history.selected, 0);
+        assert!(app.status_hint(120).contains("enter resume"));
+
+        app.handle_history_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.history.is_some(), "resume stays open without pi");
+        assert!(app.pending_switch.is_none());
+        assert!(app
+            .status
+            .as_ref()
+            .is_some_and(|(message, _)| message == "pi is not installed"));
+
+        app.handle_history_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(
+            app.history.as_ref().and_then(|history| history.confirm.as_ref()),
+            Some(&file)
+        );
+        app.handle_history_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(!file.exists());
+        assert!(app
+            .history
+            .as_ref()
+            .is_some_and(|history| history.sessions.is_empty()));
+
+        app.handle_history_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.history.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "spawns a real pi process; run with cargo test -- --ignored"]
+    fn end_to_end_history_resume_with_pi() {
+        if crate::pi::find_pi().is_none() {
+            return;
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root, false);
+        for _ in 0..200 {
+            app.drain_pi();
+            if app.session_path.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(app.session_path.is_some(), "pi should report a session file");
+
+        app.open_history();
+        let Some(path) = app
+            .history
+            .as_ref()
+            .expect("history open")
+            .sessions
+            .first()
+            .map(|session| session.path.clone())
+        else {
+            app.shutdown();
+            return;
+        };
+
+        app.resume_session(path.clone());
+        for _ in 0..200 {
+            app.drain_pi();
+            if app.pending_switch.is_none() && !app.agent.entries.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(app.pending_switch.is_none(), "switch should complete");
+        assert_eq!(app.session_path.as_deref(), Some(path.as_path()));
+        assert!(
+            !app.agent.entries.is_empty(),
+            "resumed transcript should load"
+        );
+        app.shutdown();
+    }
+
+    fn make_git_repo(prefix: &str) -> (PathBuf, PathBuf) {
+        fn git(dir: &Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let repo = base.join("repo");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&repo).expect("create repo");
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "smol@example.com"]);
+        git(&repo, &["config", "user.name", "smol test"]);
+        fs::write(repo.join("note.txt"), "one\n").expect("write note");
+        fs::write(repo.join("extra.txt"), "alpha\n").expect("write extra");
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "initial"]);
+        fs::write(repo.join("note.txt"), "one\ntwo\n").expect("update note");
+        fs::write(repo.join("extra.txt"), "alpha\nbeta\n").expect("update extra");
+        (base, repo)
+    }
+
+    #[test]
+    fn diff_view_keeps_git_workflow_usable() {
+        let (base, repo) = make_git_repo("smol-diff-commit");
+        let mut app = App::new(repo, true);
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.diff.is_some(), "change should open its diff");
+
+        // typing a commit message works while the diff is open
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.git.input_focus, "commit input should focus");
+        for ch in "add queue".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.git.input, "add queue");
+        assert!(app.status_hint(120).contains("enter commit"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.git.changes.is_empty(),
+            "commit should run while the diff is open"
+        );
+        assert!(!app.git.input_focus);
+        assert!(app.diff.is_none(), "the stale diff closes after a commit");
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn diff_view_only_takes_over_the_editor_keys() {
+        let (base, repo) = make_git_repo("smol-diff-keys");
+        let mut app = App::new(repo, true);
+        let lines = (0..40)
+            .map(|index| DiffLine {
+                kind: DiffKind::Context,
+                text: format!("line {index}"),
+            })
+            .collect();
+        app.diff = Some(DiffView {
+            title: "M  note.txt".to_string(),
+            lines,
+            scroll: 0,
+        });
+
+        // with the editor focused the diff scrolls and owns the keys
+        app.focus = Focus::Editor;
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.diff.as_ref().map(|diff| diff.scroll), Some(1));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.diff.is_none());
+
+        // with the sidebar focused the list keeps its keys
+        app.diff = Some(DiffView {
+            title: "M  note.txt".to_string(),
+            lines: (0..40)
+                .map(|index| DiffLine {
+                    kind: DiffKind::Context,
+                    text: format!("line {index}"),
+                })
+                .collect(),
+            scroll: 0,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        let selected = app.git.selected;
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_ne!(app.git.selected, selected, "list should move");
+        assert_eq!(
+            app.diff.as_ref().map(|diff| diff.scroll),
+            Some(0),
+            "the diff should not scroll"
+        );
+
+        // global shortcuts keep working too
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(app.agent_hidden, "ctrl+b should still work");
+        app.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        assert_ne!(app.focus, Focus::Tree, "f6 should still cycle focus");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.diff.is_none(), "esc should close the diff");
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn ctrl_r_opens_and_esc_closes_session_history() {
+        let root = temp_root("smol-ctrl-r");
+        let mut app = App::new(root.clone(), true);
+        app.session_dir = Some(root.join("sessions"));
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(app.history.is_some());
+        assert!(app
+            .history
+            .as_ref()
+            .is_some_and(|history| history.sessions.is_empty()));
+        assert!(app.status_hint(120).contains("esc close"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.history.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn switch_session_response_updates_active_path() {
+        let mut app = test_app();
+        let path = PathBuf::from("/tmp/smol-test-session.jsonl");
+        app.pending_switch = Some(path.clone());
+
+        app.on_response(&json!({
+            "type": "response",
+            "command": "switch_session",
+            "success": true,
+            "data": { "cancelled": false }
+        }));
+
+        assert_eq!(app.session_path.as_ref(), Some(&path));
+        assert_eq!(
+            app.session_dir.as_deref(),
+            path.parent().map(Path::new)
+        );
+        assert!(app.pending_switch.is_none());
+        assert!(app.status.as_ref().is_some_and(|(text, _)| text == "loading session"));
     }
 }

@@ -75,6 +75,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.ui.agent_divider = (right > 0).then_some(main.x + left + editor_width);
     app.ui.agent = Rect::default();
     app.ui.agent_thinking.clear();
+    app.ui.diff_header = Rect::default();
 
     draw_sidebar(frame, tree_rect, app);
     draw_editor(frame, editor_rect, app);
@@ -83,6 +84,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_menu(frame, main, app);
     draw_context_menu(frame, main, app);
+    draw_session_history(frame, main, app);
     draw_file_dialog(frame, main, app);
     draw_status(frame, status, app);
 }
@@ -1356,6 +1358,11 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         width: area.width,
         height: 1,
     };
+    app.ui.diff_header = header;
+    let hint = "esc close";
+    let hint_width = display_width(hint) as u16;
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(hint_width)]).areas(header);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1366,12 +1373,21 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &mut App) {
             ),
             Span::styled("  ", Style::default().fg(theme::FAINT)),
             Span::styled(
-                clip_display(&diff.title, area.width.saturating_sub(6) as usize),
+                clip_display(&diff.title, left.width.saturating_sub(4) as usize),
                 Style::default().fg(theme::DIM),
             ),
         ]))
         .style(Style::default().bg(theme::BG)),
-        header,
+        left,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme::FAINT),
+        )))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(theme::BG)),
+        right,
     );
 
     let body = app.ui.editor_text;
@@ -1565,6 +1581,172 @@ fn draw_context_menu(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme::PANEL)),
         inner,
+    );
+}
+
+fn draw_session_history(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.ui.history = Rect::default();
+    app.ui.history_rows.clear();
+    let Some(history) = &app.history else {
+        return;
+    };
+    let width = area.width.saturating_sub(8).clamp(48, 88).min(area.width);
+    let desired = (history.sessions.len() as u16).saturating_add(3);
+    let height = desired.clamp(7, 22).min(area.height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+
+    let title = format!(
+        " session history · {} ",
+        history.sessions.len()
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(clip_display(&title, width.saturating_sub(4) as usize))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    app.ui.history = inner;
+
+    let width = inner.width as usize;
+    let list_height = inner.height.saturating_sub(1) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if history.sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no saved sessions yet",
+            Style::default().fg(theme::FAINT),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "send a prompt to start one",
+            Style::default().fg(theme::FAINT),
+        )));
+    } else {
+        let offset = history
+            .selected
+            .saturating_sub(list_height.saturating_sub(1));
+        for (index, session) in history
+            .sessions
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(list_height)
+        {
+            let selected = index == history.selected;
+            let active = app.session_path.as_ref() == Some(&session.path);
+            let bg = if selected {
+                theme::SELECT
+            } else {
+                theme::PANEL
+            };
+            let prefix = format!(
+                "{}{} ",
+                if selected { '>' } else { ' ' },
+                if active { '*' } else { ' ' }
+            );
+            let message_word = if session.message_count == 1 {
+                "msg"
+            } else {
+                "msgs"
+            };
+            let hint = format!("{}  {} {}", session.age(), session.message_count, message_word);
+            let hint_width = display_width(&hint);
+            let label = clip_display(
+                &session.label(),
+                width.saturating_sub(display_width(&prefix) + hint_width + 3),
+            );
+            let label_width = display_width(&label);
+            let used = display_width(&prefix) + label_width + hint_width + 1;
+            let gap = width.saturating_sub(used);
+
+            let label_style = Style::default()
+                .fg(if selected { theme::FG } else { theme::DIM })
+                .bg(bg);
+            let hint_style = Style::default()
+                .fg(if selected { theme::FG } else { theme::FAINT })
+                .bg(bg);
+            let mut spans = vec![Span::styled(
+                format!("{prefix}{label}"),
+                label_style,
+            )];
+            spans.push(Span::styled(" ".repeat(gap), label_style));
+            spans.push(Span::styled(hint, hint_style));
+            let row_y = inner.y + (lines.len() as u16);
+            lines.push(Line::from(spans));
+            if row_y < inner.y + inner.height {
+                app.ui.history_rows.push((
+                    Rect {
+                        x: inner.x,
+                        y: row_y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                    index,
+                ));
+            }
+        }
+    }
+
+    while lines.len() < list_height {
+        lines.push(Line::from(""));
+    }
+    lines.truncate(list_height);
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::PANEL)),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: list_height as u16,
+        },
+    );
+
+    let footer = if let Some(path) = &history.confirm {
+        let name = history
+            .sessions
+            .iter()
+            .find(|session| &session.path == path)
+            .map(|session| session.label())
+            .unwrap_or_default();
+        format!(
+            "press d or enter to delete {}  esc cancel",
+            clip_display(&name, width.saturating_sub(40))
+        )
+    } else if history.sessions.is_empty() {
+        "esc close".to_string()
+    } else {
+        "enter resume  d delete  r refresh  esc close".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            clip_display(&footer, width),
+            Style::default().fg(if history.confirm.is_some() {
+                theme::AMBER
+            } else {
+                theme::FAINT
+            }),
+        )))
+        .style(Style::default().bg(theme::PANEL)),
+        Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        },
     );
 }
 
@@ -1992,7 +2174,7 @@ fn install_command() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{DiffLine, DiffView, PointerShape};
+    use crate::app::{DiffLine, DiffView, PointerShape, SessionHistory, SessionInfo};
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2355,6 +2537,37 @@ mod tests {
     }
 
     #[test]
+    fn clicking_diff_title_closes_it() {
+        let (base, repo) = make_git_repo("click-diff-close");
+        let mut app = App::new(repo, true);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        screen(&mut app);
+        let x = app.ui.tree.x + 2;
+        let y = app.ui.tree_body.y;
+        click(&mut app, x, y);
+        assert!(app.diff.is_some());
+        let text = screen(&mut app);
+        assert!(text.contains("esc close"), "the title should offer a way out");
+
+        let header = app.ui.diff_header;
+        assert!(header.width > 0, "the diff title should be clickable");
+        let title_line = text.lines().nth(header.y as usize).unwrap_or_default();
+        assert!(
+            title_line.contains("esc close"),
+            "the diff title should show how to close it: {title_line}"
+        );
+
+        // clicking the diff body does not close it
+        click(&mut app, header.x + 4, header.y + 3);
+        assert!(app.diff.is_some(), "only the title closes the diff");
+
+        // clicking the title does
+        click(&mut app, header.x + 4, header.y);
+        assert!(app.diff.is_none());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn status_hints_change_with_sidebar() {
         let mut app = App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")), true);
         screen(&mut app);
@@ -2534,5 +2747,44 @@ mod tests {
         let text = screen(&mut app);
         assert!(text.contains("rename README.md"));
         assert!(text.contains("enter confirm"));
+    }
+
+    #[test]
+    fn session_history_overlay_renders_sessions() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root.clone(), true);
+        let active = root.join("active.jsonl");
+        let second = root.join("second.jsonl");
+        app.session_path = Some(active.clone());
+        app.history = Some(SessionHistory {
+            sessions: vec![
+                SessionInfo {
+                    path: active,
+                    cwd: root.to_string_lossy().to_string(),
+                    name: Some("fix parser".to_string()),
+                    first_message: "first prompt".to_string(),
+                    message_count: 4,
+                    modified: std::time::SystemTime::now(),
+                },
+                SessionInfo {
+                    path: second,
+                    cwd: root.to_string_lossy().to_string(),
+                    name: None,
+                    first_message: "second prompt".to_string(),
+                    message_count: 1,
+                    modified: std::time::SystemTime::now(),
+                },
+            ],
+            selected: 1,
+            confirm: None,
+        });
+
+        let text = screen(&mut app);
+        assert!(text.contains("session history"));
+        assert!(text.contains("fix parser"));
+        assert!(text.contains("second prompt"));
+        assert!(text.contains("enter resume"));
+        assert_eq!(app.ui.history_rows.len(), 2);
+        assert!(app.ui.history.width > 0);
     }
 }

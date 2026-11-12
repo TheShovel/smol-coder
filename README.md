@@ -38,6 +38,7 @@ Run `smol --help` for all options.
 | `Alt+1`, `Alt+2`, `Alt+3` | Focus files, editor, or agent |
 | `Ctrl+G` | Switch files and git sidebar |
 | `Ctrl+B` | Hide or show the agent pane |
+| `Ctrl+R` | Open session history to resume or delete a session |
 | `Ctrl+S` | Save |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Q` | Quit |
@@ -66,10 +67,12 @@ The command menu groups actions into `Files`, `Settings`, `LLM commands`, and `G
 smol starts pi as a subprocess in the project folder:
 
 ```bash
-pi --mode rpc --no-session
+pi --mode rpc
 ```
 
-pi manages authentication, models, and sessions. If it is missing, the agent pane links to its installer. Type `/help` in the agent input for available commands. The command menu's `LLM commands` submenu can explain or review the current file, explain or refactor a selection, add tests, and format the file. Commands that edit a file require it to be saved first.
+pi manages authentication, models, and sessions. Sessions are saved by pi under `~/.pi/agent/sessions/`, so the agent pane keeps a history you can reopen: `Ctrl+R`, `/history`, or the command menu's `Session history` entry lists saved sessions for the current project, with `Enter` to resume one and `d` to delete it (confirm with `d` or `Enter`).
+
+If pi is missing, the agent pane links to its installer. Type `/help` in the agent input for available commands. The command menu's `LLM commands` submenu can explain or review the current file, explain or refactor a selection, add tests, and format the file. Commands that edit a file require it to be saved first.
 
 smol checks context usage after each run and compacts automatically at 95%. pi's built-in auto-compaction is disabled so smol controls the threshold; `/compact` still compacts manually.
 
@@ -87,7 +90,7 @@ The git sidebar shows changed files. Click a change to open its diff in the edit
 | `r` | Refresh |
 | `o` | Open the selected file |
 
-Commits stage all changes. Diffs open in the editor and support keyboard and mouse scrolling.
+Commits stage all changes. Diffs open in the editor and support keyboard and mouse scrolling. Press `Esc` (or `q`) or click the diff title to close it; while a diff is open the sidebar, the commit input, and the agent prompt keep their keys, so you can still browse changes, commit, or type a prompt.
 
 ## Editing
 

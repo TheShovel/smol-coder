@@ -24,7 +24,7 @@ pub struct PiClient {
 impl PiClient {
     pub fn spawn(pi: &Path, cwd: &Path) -> std::io::Result<Self> {
         let mut child = Command::new(pi)
-            .args(["--mode", "rpc", "--no-session"])
+            .args(["--mode", "rpc"])
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
