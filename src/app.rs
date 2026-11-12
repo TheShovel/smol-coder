@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -94,6 +96,7 @@ pub struct UiRects {
     pub agent_input: Rect,
     pub agent_thinking: Vec<(Rect, usize)>,
     pub status: Rect,
+    pub context_menu: Rect,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -106,6 +109,20 @@ pub enum ToolState {
 pub struct ToolEntry {
     pub label: String,
     pub state: ToolState,
+    pub body: Vec<ToolBodyLine>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToolBodyKind {
+    Text,
+    Add,
+    Del,
+    Meta,
+}
+
+pub struct ToolBodyLine {
+    pub kind: ToolBodyKind,
+    pub text: String,
 }
 
 pub enum Entry {
@@ -182,6 +199,111 @@ pub struct MenuPage {
 }
 pub struct CommandMenu {
     pub pages: Vec<MenuPage>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContextAction {
+    Open,
+    OpenDefault,
+    NewFile,
+    NewFolder,
+    Rename,
+    Delete,
+    CopyPath,
+    CopyRelativePath,
+}
+
+pub struct ContextMenuItem {
+    pub label: &'static str,
+    pub hint: &'static str,
+    pub action: ContextAction,
+}
+
+pub struct ContextMenu {
+    pub target: PathBuf,
+    pub is_dir: bool,
+    pub selected: usize,
+    pub anchor: (u16, u16),
+    pub items: Vec<ContextMenuItem>,
+}
+
+#[derive(Clone)]
+pub struct TextPrompt {
+    pub title: String,
+    pub value: String,
+    pub cursor: usize,
+}
+
+impl TextPrompt {
+    fn new(title: impl Into<String>, value: impl Into<String>) -> Self {
+        let value = value.into();
+        let cursor = value.chars().count();
+        Self {
+            title: title.into(),
+            value,
+            cursor,
+        }
+    }
+
+    fn insert(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        let mut chars: Vec<char> = self.value.chars().collect();
+        chars.insert(self.cursor.min(chars.len()), ch);
+        self.cursor = (self.cursor + 1).min(chars.len());
+        self.value = chars.into_iter().collect();
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        for ch in text.chars().filter(|ch| !ch.is_control()) {
+            self.insert(ch);
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let mut chars: Vec<char> = self.value.chars().collect();
+        chars.remove(self.cursor - 1);
+        self.cursor -= 1;
+        self.value = chars.into_iter().collect();
+    }
+
+    fn delete(&mut self) {
+        let mut chars: Vec<char> = self.value.chars().collect();
+        if self.cursor < chars.len() {
+            chars.remove(self.cursor);
+            self.value = chars.into_iter().collect();
+        }
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.value.chars().count());
+    }
+}
+
+#[derive(Clone)]
+pub enum FileDialog {
+    Rename {
+        target: PathBuf,
+        prompt: TextPrompt,
+    },
+    Create {
+        parent: PathBuf,
+        is_dir: bool,
+        prompt: TextPrompt,
+    },
+    Delete {
+        target: PathBuf,
+        is_dir: bool,
+        dirty: bool,
+    },
 }
 
 fn submenu_item(label: &str, count: usize, kind: MenuPageKind) -> MenuItem {
@@ -341,9 +463,10 @@ impl Agent {
         true
     }
 
-    fn push_tool(&mut self, id: &str, label: String, state: ToolState) {
+    fn push_tool(&mut self, id: &str, label: String, state: ToolState, body: Vec<ToolBodyLine>) {
         let index = self.entries.len();
-        self.entries.push(Entry::Tool(ToolEntry { label, state }));
+        self.entries
+            .push(Entry::Tool(ToolEntry { label, state, body }));
         self.tools.insert(id.to_string(), index);
         self.scroll = 0;
     }
@@ -539,10 +662,13 @@ pub struct App {
     pub tracks: Vec<Track>,
     pub ui: UiRects,
     pub now: Instant,
+    pub started_at: Instant,
     last_tree_refresh: Instant,
     pub model: Option<String>,
     pub diff: Option<DiffView>,
     pub menu: Option<CommandMenu>,
+    pub context_menu: Option<ContextMenu>,
+    pub dialog: Option<FileDialog>,
     pub unsupported: Option<PathBuf>,
     pub dragging: bool,
     pub agent_hidden: bool,
@@ -551,6 +677,8 @@ pub struct App {
     pub resizing: Option<ResizeEdge>,
     pub hover: Option<(u16, u16)>,
     pub hover_edge: Option<ResizeEdge>,
+    pub follow_editor_cursor: bool,
+    last_tree_click: Option<(Instant, Option<usize>)>,
     pointer: PointerShape,
     pointer_dirty: bool,
     pub commands: Vec<PiCommand>,
@@ -561,6 +689,7 @@ pub struct App {
     pending: HashMap<String, PendingTool>,
     pi_stderr: Vec<String>,
     pi_exited: bool,
+    project_lines: Option<Receiver<Vec<String>>>,
 }
 
 impl App {
@@ -569,23 +698,31 @@ impl App {
         let project_files = tree.files();
         let editor = Editor::new(&root);
         let git = Git::new(&root);
-        let pi = if force_no_pi {
-            PiState::Missing
+        let project_lines = if cfg!(test) {
+            None
         } else {
-            match find_pi() {
-                Some(path) => match PiClient::spawn(&path, &root) {
-                    Ok(mut client) => {
-                        let _ = client.get_state();
-                        let _ = client.send(json!({ "type": "get_commands" }));
-                        let _ =
-                            client.send(json!({ "type": "set_auto_compaction", "enabled": false }));
-                        let _ = client.send(json!({ "type": "get_session_stats" }));
-                        PiState::Running(client)
-                    }
-                    Err(error) => PiState::Failed(format!("could not start pi: {error}")),
-                },
-                None => PiState::Missing,
-            }
+            let (tx, rx) = mpsc::channel();
+            let scan_root = root.clone();
+            thread::spawn(move || {
+                let lines = crate::predict::scan_project(&scan_root);
+                let _ = tx.send(lines);
+            });
+            Some(rx)
+        };
+        let pi_path = if force_no_pi { None } else { find_pi() };
+        let pi = match pi_path.clone() {
+            Some(path) => match PiClient::spawn(&path, &root) {
+                Ok(mut client) => {
+                    let _ = client.get_state();
+                    let _ = client.send(json!({ "type": "get_commands" }));
+                    let _ = client.send(json!({ "type": "get_available_models" }));
+                    let _ = client.send(json!({ "type": "set_auto_compaction", "enabled": false }));
+                    let _ = client.send(json!({ "type": "get_session_stats" }));
+                    PiState::Running(client)
+                }
+                Err(error) => PiState::Failed(format!("could not start pi: {error}")),
+            },
+            None => PiState::Missing,
         };
 
         Self {
@@ -603,10 +740,13 @@ impl App {
             tracks: Vec::new(),
             ui: UiRects::default(),
             now: Instant::now(),
+            started_at: Instant::now(),
             last_tree_refresh: Instant::now(),
             model: None,
             diff: None,
             menu: None,
+            context_menu: None,
+            dialog: None,
             unsupported: None,
             dragging: false,
             agent_hidden: false,
@@ -615,6 +755,8 @@ impl App {
             resizing: None,
             hover: None,
             hover_edge: None,
+            follow_editor_cursor: true,
+            last_tree_click: None,
             pointer: PointerShape::Default,
             pointer_dirty: false,
             commands: Vec::new(),
@@ -625,6 +767,7 @@ impl App {
             pending: HashMap::new(),
             pi_stderr: Vec::new(),
             pi_exited: false,
+            project_lines,
         }
     }
 
@@ -842,21 +985,6 @@ impl App {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                let labels: Vec<String> = self
-                    .models
-                    .iter()
-                    .take(20)
-                    .filter_map(|model| {
-                        let provider = model.get("provider").and_then(Value::as_str)?;
-                        let id = model.get("id").and_then(Value::as_str)?;
-                        Some(format!("{provider}/{id}"))
-                    })
-                    .collect();
-                if labels.is_empty() {
-                    self.agent.note("no models available");
-                } else {
-                    self.agent.note(format!("models\n{}", labels.join("\n")));
-                }
             }
             "set_model" => {
                 let name = value
@@ -949,7 +1077,8 @@ impl App {
             _ => None,
         };
         let label = tool_label(name, &args, path.as_deref(), &self.root);
-        self.agent.push_tool(&id, label, ToolState::Running);
+        let body = tool_body(name, &args);
+        self.agent.push_tool(&id, label, ToolState::Running, body);
 
         let Some(path) = path else {
             return;
@@ -1024,7 +1153,10 @@ impl App {
 
             if kind == TrackKind::Write {
                 self.refresh_tree();
-                self.reload_after_tool(&path);
+                if !failed {
+                    self.follow_file(&path);
+                    self.reload_after_tool(&path);
+                }
             }
         }
     }
@@ -1144,6 +1276,23 @@ impl App {
         self.tracks
             .retain(|track| track.active || track.until > self.now);
 
+        let mut project_lines = None;
+        let mut project_lines_done = false;
+        if let Some(rx) = &self.project_lines {
+            match rx.try_recv() {
+                Ok(lines) => project_lines = Some(lines),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => project_lines_done = true,
+            }
+        }
+        if project_lines_done {
+            self.project_lines = None;
+        }
+        if let Some(lines) = project_lines {
+            self.project_lines = None;
+            self.editor.add_project_lines(lines);
+        }
+
         self.editor.tick(self.now);
 
         if let Some(result) = self.git.poll_push() {
@@ -1166,6 +1315,14 @@ impl App {
     fn refresh_tree(&mut self) {
         self.tree.refresh();
         self.project_files = self.tree.files();
+        let removed = self.editor.close_missing();
+        if !removed.is_empty() {
+            self.set_status(if removed.len() == 1 {
+                format!("closed deleted {}", removed[0])
+            } else {
+                format!("closed {} deleted files", removed.len())
+            });
+        }
         if !self.agent.suggestions.is_empty() {
             self.agent.update_suggestions(&self.project_files);
         }
@@ -1418,6 +1575,14 @@ impl App {
             self.should_quit = true;
             return;
         }
+        if self.dialog.is_some() {
+            self.handle_dialog_key(key, ctrl, alt);
+            return;
+        }
+        if self.context_menu.is_some() {
+            self.handle_context_key(key);
+            return;
+        }
         if ctrl && key.code == KeyCode::Char('p') {
             self.toggle_menu();
             return;
@@ -1626,7 +1791,7 @@ impl App {
             selected: 0,
             items: vec![
                 submenu_item("Files", 4, MenuPageKind::Files),
-                submenu_item("Settings", 3, MenuPageKind::Settings),
+                submenu_item("Settings", 4, MenuPageKind::Settings),
                 submenu_item("LLM commands", 6, MenuPageKind::Llm),
                 submenu_item("Git", 2, MenuPageKind::Git),
                 MenuItem {
@@ -1862,6 +2027,323 @@ impl App {
         }
     }
 
+    fn context_items(is_dir: bool, expanded: bool) -> Vec<ContextMenuItem> {
+        let first = if is_dir {
+            if expanded {
+                "Collapse folder"
+            } else {
+                "Expand folder"
+            }
+        } else {
+            "Open"
+        };
+        vec![
+            ContextMenuItem {
+                label: first,
+                hint: "enter",
+                action: ContextAction::Open,
+            },
+            ContextMenuItem {
+                label: "Open in default app",
+                hint: "",
+                action: ContextAction::OpenDefault,
+            },
+            ContextMenuItem {
+                label: "New file",
+                hint: "",
+                action: ContextAction::NewFile,
+            },
+            ContextMenuItem {
+                label: "New folder",
+                hint: "",
+                action: ContextAction::NewFolder,
+            },
+            ContextMenuItem {
+                label: "Rename",
+                hint: "",
+                action: ContextAction::Rename,
+            },
+            ContextMenuItem {
+                label: "Delete",
+                hint: "",
+                action: ContextAction::Delete,
+            },
+            ContextMenuItem {
+                label: "Copy path",
+                hint: "",
+                action: ContextAction::CopyPath,
+            },
+            ContextMenuItem {
+                label: "Copy relative path",
+                hint: "",
+                action: ContextAction::CopyRelativePath,
+            },
+        ]
+    }
+
+    fn open_context_menu(&mut self, x: u16, y: u16) {
+        let Some(node) = self.tree.selected_node() else {
+            return;
+        };
+        let target = node.path.clone();
+        let is_dir = node.is_dir;
+        let expanded = node.expanded;
+        self.context_menu = Some(ContextMenu {
+            target,
+            is_dir,
+            selected: 0,
+            anchor: (x, y),
+            items: Self::context_items(is_dir, expanded),
+        });
+    }
+
+    fn handle_context_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.context_menu = None,
+            KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1).min(menu.items.len().saturating_sub(1));
+            }
+            KeyCode::Home => menu.selected = 0,
+            KeyCode::End => menu.selected = menu.items.len().saturating_sub(1),
+            KeyCode::Enter => {
+                if let Some(action) = menu.items.get(menu.selected).map(|item| item.action) {
+                    self.run_context_action(action);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_create_dialog(&mut self, parent: PathBuf, is_dir: bool) {
+        let kind = if is_dir { "folder" } else { "file" };
+        let location = self.editor.rel_of(&parent);
+        self.dialog = Some(FileDialog::Create {
+            parent,
+            is_dir,
+            prompt: TextPrompt::new(format!("new {kind} in {location}"), ""),
+        });
+    }
+
+    fn run_context_action(&mut self, action: ContextAction) {
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        let target = menu.target;
+        let is_dir = menu.is_dir;
+        match action {
+            ContextAction::Open => {
+                if is_dir {
+                    self.tree.toggle_selected();
+                } else {
+                    self.open_file(&target);
+                }
+            }
+            ContextAction::OpenDefault => match open_in_default_app(&target) {
+                Ok(()) => self.set_status("opened in default app"),
+                Err(error) => self.set_status(error),
+            },
+            ContextAction::NewFile | ContextAction::NewFolder => {
+                let parent = if is_dir {
+                    target.clone()
+                } else {
+                    target
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.root.clone())
+                };
+                self.open_create_dialog(parent, matches!(action, ContextAction::NewFolder));
+            }
+            ContextAction::Rename => {
+                let name = target
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.dialog = Some(FileDialog::Rename {
+                    target,
+                    prompt: TextPrompt::new(format!("rename {name}"), name),
+                });
+            }
+            ContextAction::Delete => {
+                let dirty = self.editor.buffers.iter().any(|buffer| {
+                    buffer.dirty && (buffer.path == target || buffer.path.starts_with(&target))
+                });
+                self.dialog = Some(FileDialog::Delete {
+                    target,
+                    is_dir,
+                    dirty,
+                });
+            }
+            ContextAction::CopyPath => {
+                let text = target.display().to_string();
+                self.copy_text(&text, "copied path");
+            }
+            ContextAction::CopyRelativePath => {
+                let text = self.editor.rel_of(&target).replace('\\', "/");
+                self.copy_text(&text, "copied relative path");
+            }
+        }
+    }
+
+    fn handle_dialog_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool) {
+        let mut submit = false;
+        let mut cancel = false;
+        let paste = (ctrl && key.code == KeyCode::Char('v'))
+            .then(|| self.clipboard_text())
+            .flatten();
+        if let Some(dialog) = self.dialog.as_mut() {
+            match dialog {
+                FileDialog::Delete { .. } => match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => cancel = true,
+                    KeyCode::Enter | KeyCode::Char('y') => submit = true,
+                    _ => {}
+                },
+                FileDialog::Rename { prompt, .. } | FileDialog::Create { prompt, .. } => {
+                    match key.code {
+                        KeyCode::Esc => cancel = true,
+                        KeyCode::Enter => submit = true,
+                        KeyCode::Backspace => prompt.backspace(),
+                        KeyCode::Delete => prompt.delete(),
+                        KeyCode::Left => prompt.left(),
+                        KeyCode::Right => prompt.right(),
+                        KeyCode::Home => prompt.cursor = 0,
+                        KeyCode::End => prompt.cursor = prompt.value.chars().count(),
+                        KeyCode::Char('v') if ctrl => {
+                            if let Some(text) = paste.as_deref() {
+                                prompt.insert_text(text);
+                            }
+                        }
+                        KeyCode::Char('u') if ctrl => {
+                            prompt.value.clear();
+                            prompt.cursor = 0;
+                        }
+                        KeyCode::Char(ch) if !ctrl && !alt => prompt.insert(ch),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if cancel {
+            self.dialog = None;
+        } else if submit {
+            self.submit_dialog();
+        }
+    }
+
+    fn submit_dialog(&mut self) {
+        let Some(dialog) = self.dialog.clone() else {
+            return;
+        };
+        match dialog {
+            FileDialog::Rename { target, prompt } => {
+                let parent = target
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.root.clone());
+                let path = match child_path(&parent, &prompt.value) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.set_status(error);
+                        return;
+                    }
+                };
+                if path == target {
+                    self.dialog = None;
+                    self.set_status("name unchanged");
+                    return;
+                }
+                if fs::symlink_metadata(&path).is_ok() {
+                    self.set_status(format!("{} already exists", self.editor.rel_of(&path)));
+                    return;
+                }
+                if let Err(error) = fs::rename(&target, &path) {
+                    self.set_status(format!("rename failed: {error}"));
+                    return;
+                }
+                self.dialog = None;
+                let path = fs::canonicalize(&path).unwrap_or(path);
+                self.editor.rename_path(&target, &path);
+                if let Some(open) = self.unsupported.take() {
+                    self.unsupported = Some(remap_path(&open, &target, &path));
+                }
+                for track in &mut self.tracks {
+                    track.path = remap_path(&track.path, &target, &path);
+                }
+                self.refresh_tree();
+                self.tree.reveal(&path);
+                self.set_status(format!("renamed to {}", self.editor.rel_of(&path)));
+            }
+            FileDialog::Create {
+                parent,
+                is_dir,
+                prompt,
+            } => {
+                let path = match child_path(&parent, &prompt.value) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.set_status(error);
+                        return;
+                    }
+                };
+                if fs::symlink_metadata(&path).is_ok() {
+                    self.set_status(format!("{} already exists", self.editor.rel_of(&path)));
+                    return;
+                }
+                let result = if is_dir {
+                    fs::create_dir(&path)
+                } else {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .map(drop)
+                };
+                if let Err(error) = result {
+                    self.set_status(format!("create failed: {error}"));
+                    return;
+                }
+                self.dialog = None;
+                self.refresh_tree();
+                if is_dir {
+                    self.tree.reveal(&path);
+                    self.focus = Focus::Tree;
+                    self.set_status(format!("created {}", self.editor.rel_of(&path)));
+                } else {
+                    self.open_file(&path);
+                    self.set_status(format!("created {}", self.editor.rel_of(&path)));
+                }
+            }
+            FileDialog::Delete { target, .. } => {
+                if let Err(error) = delete_entry(&target) {
+                    self.set_status(format!("delete failed: {error}"));
+                    return;
+                }
+                self.dialog = None;
+                self.editor.remove_paths(&target);
+                self.tracks
+                    .retain(|track| track.path != target && !track.path.starts_with(&target));
+                if self
+                    .unsupported
+                    .as_ref()
+                    .is_some_and(|open| open == &target || open.starts_with(&target))
+                {
+                    self.unsupported = None;
+                }
+                let parent = target
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.root.clone());
+                self.refresh_tree();
+                self.tree.reveal(&parent);
+                self.focus = Focus::Tree;
+                self.set_status(format!("deleted {}", self.editor.rel_of(&target)));
+            }
+        }
+    }
+
     fn ensure_pi(&mut self) -> bool {
         match &self.pi {
             PiState::Missing => {
@@ -2035,6 +2517,7 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool) {
+        self.follow_editor_cursor = true;
         if self.unsupported.is_some() {
             match key.code {
                 KeyCode::Enter | KeyCode::Char('o') => self.open_unsupported_in_default(),
@@ -2196,6 +2679,18 @@ impl App {
 
     pub fn status_hint(&self, width: u16) -> String {
         let full = width >= 110;
+        if let Some(dialog) = &self.dialog {
+            return match dialog {
+                FileDialog::Delete { .. } => "enter delete  esc cancel",
+                FileDialog::Rename { .. } | FileDialog::Create { .. } => {
+                    "enter confirm  esc cancel"
+                }
+            }
+            .to_string();
+        }
+        if self.context_menu.is_some() {
+            return "up/down select  enter run  esc close".to_string();
+        }
         if let Some(menu) = &self.menu {
             return if menu.pages.len() > 1 {
                 "enter run  esc back"
@@ -2246,10 +2741,10 @@ impl App {
                 Sidebar::Files => {
                     if full {
                         return format!(
-                            "enter open  h/l fold  {sidebar_toggle}  {agent_toggle}  ctrl+q quit"
+                            "enter open  right-click menu  h/l fold  {sidebar_toggle}  {agent_toggle}  ctrl+q quit"
                         );
                     }
-                    return format!("enter open  {sidebar_toggle}  ctrl+q quit");
+                    return format!("enter open  right-click menu  {sidebar_toggle}  ctrl+q quit");
                 }
             }
             .to_string();
@@ -2342,6 +2837,7 @@ impl App {
             Ok(()) => {
                 self.unsupported = None;
                 self.focus = Focus::Editor;
+                self.follow_editor_cursor = true;
                 self.tree.reveal(path);
             }
             Err(error) if is_unsupported_error(&error) => self.show_unsupported(path),
@@ -2392,6 +2888,74 @@ impl App {
         let x = mouse.column;
         let y = mouse.row;
         self.hover = Some((x, y));
+        if self.dialog.is_some() {
+            return;
+        }
+        if self.context_menu.is_some() {
+            self.refresh_hover();
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let rect = self.ui.context_menu;
+                    if inside(rect, x, y)
+                        && y > rect.y
+                        && y + 1 < rect.y.saturating_add(rect.height)
+                    {
+                        let row = y.saturating_sub(rect.y + 1) as usize;
+                        if let Some(menu) = &mut self.context_menu {
+                            if row < menu.items.len() {
+                                menu.selected = row;
+                            }
+                        }
+                        let action = self
+                            .context_menu
+                            .as_ref()
+                            .and_then(|menu| menu.items.get(row))
+                            .map(|item| item.action);
+                        if let Some(action) = action {
+                            self.run_context_action(action);
+                        }
+                    } else {
+                        self.context_menu = None;
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    if self.sidebar == Sidebar::Files && self.tree_hover_row(x, y).is_some() {
+                        let row = y.saturating_sub(self.ui.tree_body.y) as usize;
+                        self.tree.select_row(row);
+                        self.focus = Focus::Tree;
+                        self.open_context_menu(x, y);
+                    } else {
+                        self.context_menu = None;
+                    }
+                }
+                MouseEventKind::Moved => {
+                    let rect = self.ui.context_menu;
+                    if inside(rect, x, y)
+                        && y > rect.y
+                        && y + 1 < rect.y.saturating_add(rect.height)
+                    {
+                        let row = y.saturating_sub(rect.y + 1) as usize;
+                        if let Some(menu) = &mut self.context_menu {
+                            if row < menu.items.len() {
+                                menu.selected = row;
+                            }
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Some(menu) = &mut self.context_menu {
+                        menu.selected = menu.selected.saturating_sub(1);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(menu) = &mut self.context_menu {
+                        menu.selected = (menu.selected + 1).min(menu.items.len().saturating_sub(1));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.menu.is_some() {
             return;
         }
@@ -2413,11 +2977,20 @@ impl App {
                     return;
                 }
                 MouseEventKind::Down(MouseButton::Left) if inside(self.ui.tree, x, y) => {}
+                MouseEventKind::Down(MouseButton::Right) if inside(self.ui.tree, x, y) => {}
                 _ => return,
             }
         }
 
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.sidebar == Sidebar::Files && self.tree_hover_row(x, y).is_some() {
+                    let row = y.saturating_sub(self.ui.tree_body.y) as usize;
+                    self.tree.select_row(row);
+                    self.focus = Focus::Tree;
+                    self.open_context_menu(x, y);
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.git.confirm_discard = false;
                 self.dragging = false;
@@ -2427,19 +3000,26 @@ impl App {
                     self.set_pointer(PointerShape::Resize);
                     return;
                 }
+                if !inside(self.ui.tree, x, y) {
+                    self.last_tree_click = None;
+                }
                 if inside(self.ui.tree, x, y) {
                     self.focus = Focus::Tree;
                     if self.sidebar == Sidebar::Git {
                         if inside(self.ui.git_input, x, y) {
                             self.git.input_focus = true;
-                        } else if y >= self.ui.tree_body.y {
-                            if self.git_hover_row(x, y).is_some() {
-                                self.git
-                                    .select_row(y.saturating_sub(self.ui.tree_body.y) as usize);
-                                self.open_diff();
-                            }
+                        } else if y >= self.ui.tree_body.y && self.git_hover_row(x, y).is_some() {
+                            self.git
+                                .select_row(y.saturating_sub(self.ui.tree_body.y) as usize);
+                            self.open_diff();
                         }
                     } else if y >= self.ui.tree_body.y {
+                        let hover = self.tree_hover_row(x, y);
+                        let double = self.is_double_tree_click(hover);
+                        if double && hover.is_none() {
+                            self.open_create_dialog(self.root.clone(), false);
+                            return;
+                        }
                         let row = y.saturating_sub(self.ui.tree_body.y) as usize;
                         self.tree.select_row(row);
                         if let Some(path) = self.tree.activate() {
@@ -2448,6 +3028,7 @@ impl App {
                     }
                 } else if inside(self.ui.editor, x, y) {
                     self.focus = Focus::Editor;
+                    self.follow_editor_cursor = true;
                     if inside(self.ui.unsupported_button, x, y) {
                         self.open_unsupported_in_default();
                         return;
@@ -2501,6 +3082,7 @@ impl App {
                     }
                 } else if inside(self.ui.editor, x, y) {
                     let width = self.ui.editor_text.width.saturating_sub(self.ui.gutter) as usize;
+                    self.follow_editor_cursor = false;
                     self.editor.scroll_by(-3, width);
                 } else if inside(self.ui.agent, x, y) {
                     self.agent.scroll_by(3);
@@ -2514,6 +3096,7 @@ impl App {
                     }
                 } else if inside(self.ui.editor, x, y) {
                     let width = self.ui.editor_text.width.saturating_sub(self.ui.gutter) as usize;
+                    self.follow_editor_cursor = false;
                     self.editor.scroll_by(3, width);
                 } else if inside(self.ui.agent, x, y) {
                     self.agent.scroll_by(-3);
@@ -2546,6 +3129,31 @@ impl App {
             return;
         };
 
+        if self.dialog.is_some() {
+            self.hover_edge = None;
+            self.set_pointer(PointerShape::Default);
+            return;
+        }
+
+        if self.context_menu.is_some() {
+            self.hover_edge = None;
+            let rect = self.ui.context_menu;
+            let row = y.saturating_sub(rect.y + 1) as usize;
+            let over_item = inside(rect, x, y)
+                && y > rect.y
+                && y + 1 < rect.y.saturating_add(rect.height)
+                && self
+                    .context_menu
+                    .as_ref()
+                    .is_some_and(|menu| row < menu.items.len());
+            self.set_pointer(if over_item {
+                PointerShape::Pointer
+            } else {
+                PointerShape::Default
+            });
+            return;
+        }
+
         if self.diff.is_some() {
             self.hover_edge = None;
             let over_row = match self.sidebar {
@@ -2570,9 +3178,9 @@ impl App {
         if inside(self.ui.tree, x, y) {
             if self.sidebar == Sidebar::Git && inside(self.ui.git_input, x, y) {
                 self.set_pointer(PointerShape::Text);
-            } else if self.sidebar == Sidebar::Files && self.tree_hover_row(x, y).is_some() {
-                self.set_pointer(PointerShape::Pointer);
-            } else if self.sidebar == Sidebar::Git && self.git_hover_row(x, y).is_some() {
+            } else if (self.sidebar == Sidebar::Files && self.tree_hover_row(x, y).is_some())
+                || (self.sidebar == Sidebar::Git && self.git_hover_row(x, y).is_some())
+            {
                 self.set_pointer(PointerShape::Pointer);
             } else {
                 self.set_pointer(PointerShape::Default);
@@ -2597,6 +3205,15 @@ impl App {
             self.pointer = shape;
             self.pointer_dirty = true;
         }
+    }
+
+    fn is_double_tree_click(&mut self, row: Option<usize>) -> bool {
+        let now = Instant::now();
+        let double = self.last_tree_click.is_some_and(|(at, last)| {
+            last == row && now.duration_since(at) <= Duration::from_millis(400)
+        });
+        self.last_tree_click = if double { None } else { Some((now, row)) };
+        double
     }
 
     fn tree_hover_row(&self, x: u16, y: u16) -> Option<usize> {
@@ -2688,6 +3305,41 @@ impl App {
         let cells = x.saturating_sub(self.ui.editor_text.x + self.ui.gutter) as usize;
         let width = self.ui.editor_text.width.saturating_sub(self.ui.gutter) as usize;
         (row, cells, width)
+    }
+}
+
+fn child_path(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name is empty".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("name is reserved".to_string());
+    }
+    if name.contains(['/', '\\', '\0']) {
+        return Err("name cannot contain path separators".to_string());
+    }
+    Ok(parent.join(name))
+}
+
+fn remap_path(path: &Path, old: &Path, new: &Path) -> PathBuf {
+    path.strip_prefix(old)
+        .map(|suffix| {
+            if suffix.as_os_str().is_empty() {
+                new.to_path_buf()
+            } else {
+                new.join(suffix)
+            }
+        })
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn delete_entry(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
     }
 }
 
@@ -2878,6 +3530,65 @@ fn tool_label(name: &str, args: &Value, path: Option<&Path>, root: &Path) -> Str
     }
 }
 
+const MAX_TOOL_BODY_LINES: usize = 80;
+
+fn tool_body(name: &str, args: &Value) -> Vec<ToolBodyLine> {
+    let mut body = Vec::new();
+    match name {
+        "write" => {
+            if let Some(content) = args.get("content").and_then(Value::as_str) {
+                push_body_text(&mut body, content, ToolBodyKind::Text);
+            }
+        }
+        "edit" => {
+            let edits: Vec<&Value> = args
+                .get("edits")
+                .and_then(Value::as_array)
+                .map(|edits| edits.iter().collect())
+                .unwrap_or_else(|| vec![args]);
+            for (index, edit) in edits.iter().enumerate() {
+                if edits.len() > 1 {
+                    body.push(ToolBodyLine {
+                        kind: ToolBodyKind::Meta,
+                        text: format!("edit {}", index + 1),
+                    });
+                }
+                if let Some(old) = edit.get("oldText").and_then(Value::as_str) {
+                    push_body_text(&mut body, old, ToolBodyKind::Del);
+                }
+                if let Some(new) = edit.get("newText").and_then(Value::as_str) {
+                    push_body_text(&mut body, new, ToolBodyKind::Add);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if body.len() > MAX_TOOL_BODY_LINES {
+        let remaining = body.len() - MAX_TOOL_BODY_LINES;
+        body.truncate(MAX_TOOL_BODY_LINES);
+        body.push(ToolBodyLine {
+            kind: ToolBodyKind::Meta,
+            text: format!("... {remaining} more lines"),
+        });
+    }
+    body
+}
+
+fn push_body_text(body: &mut Vec<ToolBodyLine>, text: &str, kind: ToolBodyKind) {
+    let prefix = match kind {
+        ToolBodyKind::Add => "+",
+        ToolBodyKind::Del => "-",
+        _ => " ",
+    };
+    for line in text.lines() {
+        body.push(ToolBodyLine {
+            kind,
+            text: format!("{prefix} {line}"),
+        });
+    }
+}
+
 fn display_path(path: &Path, root: &Path) -> String {
     let relative = path
         .strip_prefix(root)
@@ -3058,7 +3769,7 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 
 fn base64(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let first = chunk[0] as u32;
         let second = chunk.get(1).copied().unwrap_or(0) as u32;
@@ -3298,6 +4009,24 @@ mod tests {
     }
 
     #[test]
+    fn available_models_stay_out_of_transcript() {
+        let mut app = test_app();
+        app.on_pi_record(json!({
+            "type": "response",
+            "command": "get_available_models",
+            "success": true,
+            "data": {
+                "models": [
+                    { "provider": "local", "id": "small" },
+                    { "provider": "local", "id": "large" }
+                ]
+            }
+        }));
+        assert_eq!(app.models.len(), 2);
+        assert!(app.agent.entries.is_empty());
+    }
+
+    #[test]
     fn status_hints_follow_context() {
         let mut app = test_app();
         app.open_path(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"));
@@ -3354,6 +4083,142 @@ mod tests {
 
         assert!(app.tree.nodes.iter().any(|node| node.name == "new"));
         assert!(app.project_files.iter().any(|path| path == "new/file.txt"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn right_click_opens_explorer_menu_with_file_actions() {
+        let mut app = test_app();
+        let readme = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        app.tree.reveal(&readme);
+        let position = app
+            .tree
+            .visible
+            .iter()
+            .position(|index| app.tree.nodes[*index].path == readme)
+            .expect("README row");
+        app.tree.scroll = position.saturating_sub(5);
+        app.ui.tree_body = Rect {
+            x: 0,
+            y: 1,
+            width: 30,
+            height: 20,
+        };
+        let y = 1 + (position - app.tree.scroll) as u16;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 2,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let menu = app.context_menu.as_ref().expect("context menu");
+        assert_eq!(menu.target, readme);
+        assert!(!menu.is_dir);
+        for action in [
+            ContextAction::Open,
+            ContextAction::OpenDefault,
+            ContextAction::NewFile,
+            ContextAction::NewFolder,
+            ContextAction::Rename,
+            ContextAction::Delete,
+            ContextAction::CopyPath,
+            ContextAction::CopyRelativePath,
+        ] {
+            assert!(menu.items.iter().any(|item| item.action == action));
+        }
+    }
+
+    #[test]
+    fn rename_action_updates_editor_buffer_and_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "smol-context-rename-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test project");
+        let old = root.join("old.txt");
+        fs::write(&old, "hello").expect("write file");
+        let mut app = App::new(root.clone(), true);
+        app.open_path(&old);
+        app.tree.reveal(&old);
+
+        app.open_context_menu(1, 1);
+        app.run_context_action(ContextAction::Rename);
+        match &mut app.dialog {
+            Some(FileDialog::Rename { prompt, .. }) => {
+                prompt.value = "new.txt".to_string();
+                prompt.cursor = prompt.value.chars().count();
+            }
+            _ => panic!("rename dialog missing"),
+        }
+        app.submit_dialog();
+
+        let new = root.join("new.txt");
+        assert!(!old.exists());
+        assert!(new.exists());
+        assert_eq!(
+            app.editor.buffer().map(|buffer| buffer.path.clone()),
+            Some(fs::canonicalize(&new).expect("canonical new path"))
+        );
+        assert!(app.tree.nodes.iter().any(|node| node.path == new));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_action_removes_file_and_open_buffer() {
+        let root = std::env::temp_dir().join(format!(
+            "smol-context-delete-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test project");
+        let file = root.join("doomed.txt");
+        fs::write(&file, "bye").expect("write file");
+        let opened = fs::canonicalize(&file).expect("canonical path");
+        let mut app = App::new(root.clone(), true);
+        app.open_path(&file);
+        app.tree.reveal(&file);
+
+        app.open_context_menu(1, 1);
+        app.run_context_action(ContextAction::Delete);
+        assert!(matches!(app.dialog, Some(FileDialog::Delete { .. })));
+        app.submit_dialog();
+
+        assert!(!file.exists());
+        assert!(app.dialog.is_none());
+        assert!(app.editor.find_buffer(&opened).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_folder_action_creates_folder_in_selected_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "smol-context-create-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test project");
+        let seed = root.join("seed.txt");
+        fs::write(&seed, "seed").expect("write seed");
+        let mut app = App::new(root.clone(), true);
+        app.tree.reveal(&seed);
+
+        app.open_context_menu(1, 1);
+        app.run_context_action(ContextAction::NewFolder);
+        match &mut app.dialog {
+            Some(FileDialog::Create { prompt, .. }) => {
+                prompt.value = "notes".to_string();
+                prompt.cursor = prompt.value.chars().count();
+            }
+            _ => panic!("create dialog missing"),
+        }
+        app.submit_dialog();
+
+        assert!(root.join("notes").is_dir());
+        assert!(app.tree.nodes.iter().any(|node| node.name == "notes"));
         let _ = fs::remove_dir_all(root);
     }
 

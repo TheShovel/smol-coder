@@ -55,7 +55,7 @@ Run `smol --help` for all options.
 | `Enter` | Open a file or diff, send a prompt, or commit |
 | `Esc` | Stop the agent, close a diff, or leave the git input |
 
-The file tree also supports arrows and `h`, `j`, `k`, `l`. It refreshes automatically when files and folders change. Click files and folders, drag pane dividers to resize, and drag in the editor to select text. Cut and copy use the local clipboard tool when available, otherwise the terminal's OSC 52 clipboard support; paste reads the system clipboard and falls back to text cut or copied in smol.
+The file tree also supports arrows and `h`, `j`, `k`, `l`. It refreshes automatically when files and folders change, and open buffers close themselves when their file is deleted. Double-click empty space in the tree to create a file. Click files and folders, drag pane dividers to resize, and drag in the editor to select text. Right-click an explorer entry for Open, Open in default app, New file, New folder, Rename, Delete, Copy path, and Copy relative path. Delete asks for confirmation and permanently removes the file or folder. Cut and copy use the local clipboard tool when available, otherwise the terminal's OSC 52 clipboard support; paste reads the system clipboard and falls back to text cut or copied in smol.
 
 Type `@` in the agent input to reference a project file. A list filters paths as you type; use Up/Down and Tab or Enter to insert one.
 
@@ -91,7 +91,7 @@ Commits stage all changes. Diffs open in the editor and support keyboard and mou
 
 ## Editing
 
-Inline predictions are learned from open files and accepted lines, and are stored in `~/.cache/smol/predictions.txt`.
+Inline predictions are local and instant. They learn from open files, a bounded project-wide corpus, saved line transitions, and accepted predictions. The engine uses the current line suffix, the previous line, indentation, and nearby line pairs. On an indented empty line it suggests the next line; `Tab` accepts. Before anything has been learned, a built-in set of common syntax and words (Rust, JavaScript/TypeScript, Python, Go, C/C++, and shell) provides predictions; these are only a fallback, so your own code and learned lines always take priority. Learned lines and transitions are stored in `~/.cache/smol/`. No network request, model download, or pi subprocess is involved.
 
 Binary files and files over 4 MB are not opened in the editor. Unsupported files show a button to open them with the system default application.
 

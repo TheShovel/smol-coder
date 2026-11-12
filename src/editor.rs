@@ -134,6 +134,11 @@ impl Editor {
         }
     }
 
+    pub fn add_project_lines(&mut self, lines: Vec<String>) {
+        self.predictor.add_project_lines(lines);
+        self.touch();
+    }
+
     pub fn buffer(&self) -> Option<&Buffer> {
         self.buffers.get(self.active)
     }
@@ -154,6 +159,64 @@ impl Editor {
         } else {
             relative
         }
+    }
+
+    pub fn rename_path(&mut self, old: &Path, new: &Path) {
+        let old = fs::canonicalize(old).unwrap_or_else(|_| old.to_path_buf());
+        let root = self.root.clone();
+        let mut changed = false;
+        for buffer in &mut self.buffers {
+            let Ok(suffix) = buffer.path.strip_prefix(&old) else {
+                continue;
+            };
+            let path = if suffix.as_os_str().is_empty() {
+                new.to_path_buf()
+            } else {
+                new.join(suffix)
+            };
+            buffer.rel = relative_label(&root, &path);
+            buffer.path = path;
+            buffer.highlight_dirty = true;
+            changed = true;
+        }
+        if changed {
+            self.version += 1;
+            self.clear_prediction();
+        }
+    }
+
+    pub fn remove_paths(&mut self, target: &Path) -> bool {
+        let target = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+        let before = self.buffers.len();
+        self.buffers
+            .retain(|buffer| buffer.path != target && !buffer.path.starts_with(&target));
+        if self.buffers.len() == before {
+            return false;
+        }
+        self.active = self.active.min(self.buffers.len().saturating_sub(1));
+        self.version += 1;
+        self.clear_prediction();
+        true
+    }
+
+    pub fn close_missing(&mut self) -> Vec<String> {
+        let root = self.root.clone();
+        let mut removed = Vec::new();
+        self.buffers.retain(|buffer| {
+            if buffer.path.exists() {
+                true
+            } else {
+                removed.push(relative_label(&root, &buffer.path));
+                false
+            }
+        });
+        if removed.is_empty() {
+            return removed;
+        }
+        self.active = self.active.min(self.buffers.len().saturating_sub(1));
+        self.version += 1;
+        self.clear_prediction();
+        removed
     }
 
     pub fn open(&mut self, path: &Path) -> Result<(), String> {
@@ -292,13 +355,19 @@ impl Editor {
     }
 
     pub fn save_active(&mut self) -> Result<String, String> {
-        let buffer = self.buffer().ok_or("no file open")?;
-        fs::write(&buffer.path, buffer.lines.join("\n"))
-            .map_err(|error| format!("save failed: {error}"))?;
-        let rel = buffer.rel.clone();
+        let (path, lines, rel) = {
+            let buffer = self.buffer().ok_or("no file open")?;
+            (
+                buffer.path.clone(),
+                buffer.lines.clone(),
+                buffer.rel.clone(),
+            )
+        };
+        fs::write(&path, lines.join("\n")).map_err(|error| format!("save failed: {error}"))?;
         if let Some(buffer) = self.buffers.get_mut(self.active) {
             buffer.dirty = false;
         }
+        self.predictor.learn_lines(&lines);
         Ok(format!("saved {rel}"))
     }
 
@@ -847,10 +916,10 @@ impl Editor {
             self.prediction_key = None;
             return;
         }
-        if now.duration_since(self.last_edit) < Duration::from_millis(180) {
+
+        if now.duration_since(self.last_edit) < Duration::from_millis(5) {
             return;
         }
-
         let buffer = &self.buffers[self.active];
         let key = (
             self.active,
@@ -872,15 +941,76 @@ impl Editor {
         let Some(ghost) = self.ghost.take() else {
             return false;
         };
-        if let Some(buffer) = self.buffer() {
-            let line = buffer.lines[buffer.cursor_line].clone();
-            let full = format!("{line}{ghost}");
-            self.predictor.learn(&full);
+        if !ghost.contains('\n') {
+            let learned = self.buffer().map(|buffer| {
+                let line = buffer.lines[buffer.cursor_line].clone();
+                let previous = buffer
+                    .cursor_line
+                    .checked_sub(1)
+                    .and_then(|index| buffer.lines.get(index))
+                    .cloned();
+                (previous, format!("{line}{ghost}"))
+            });
+            if let Some((previous, full)) = learned {
+                self.predictor.learn(&full);
+                if let Some(previous) = previous {
+                    self.predictor.learn_transition(&previous, &full);
+                }
+            }
         }
-        for ch in ghost.chars() {
-            self.insert_char(ch);
+        if !ghost.contains('\n') {
+            for ch in ghost.chars() {
+                self.insert_char(ch);
+            }
+            return true;
         }
+        self.insert_raw(&ghost);
         true
+    }
+
+    fn insert_raw(&mut self, text: &str) {
+        if self.buffers.get(self.active).is_none() {
+            return;
+        }
+        if let Some(buffer) = self.buffers.get_mut(self.active) {
+            buffer.remember(false);
+        }
+        self.delete_selection_internal();
+        let Some(buffer) = self.buffers.get_mut(self.active) else {
+            return;
+        };
+        let line = buffer.cursor_line;
+        let chars: Vec<char> = buffer.lines[line].chars().collect();
+        let col = buffer.cursor_col.min(chars.len());
+        let before: String = chars[..col].iter().collect();
+        let after: String = chars[col..].iter().collect();
+        let parts: Vec<&str> = text.split('\n').collect();
+        let last = parts.len().saturating_sub(1);
+        buffer.lines[line] = format!("{before}{}", parts[0]);
+        if last == 0 {
+            buffer.lines[line].push_str(&after);
+            buffer.cursor_col = col + parts[0].chars().count();
+        } else {
+            let mut inserted: Vec<String> = parts[1..last]
+                .iter()
+                .map(|part| (*part).to_string())
+                .collect();
+            inserted.push(format!("{}{}", parts[last], after));
+            let added = inserted.len();
+            buffer.lines.splice(line + 1..line + 1, inserted);
+            if line < buffer.spans.len() {
+                buffer.spans.splice(
+                    line + 1..line + 1,
+                    std::iter::repeat(Vec::new()).take(added),
+                );
+            }
+            buffer.cursor_line = line + added;
+            buffer.cursor_col = parts[last].chars().count();
+        }
+        buffer.dirty = true;
+        buffer.highlight_dirty = true;
+        self.version += 1;
+        self.touch();
     }
 
     fn compute_ghost(&self) -> Option<String> {
@@ -895,6 +1025,16 @@ impl Editor {
         if buffer.lines.len() > 60_000 {
             return None;
         }
+
+        let indent: String = line
+            .chars()
+            .take_while(|ch| *ch == ' ' || *ch == '\t')
+            .collect();
+        let previous = buffer
+            .cursor_line
+            .checked_sub(1)
+            .and_then(|index| buffer.lines.get(index))
+            .map(String::as_str);
 
         let mut corpus: Vec<&str> = buffer.lines.iter().map(String::as_str).collect();
         for (index, other) in self.buffers.iter().enumerate() {
@@ -912,7 +1052,8 @@ impl Editor {
             }
         }
 
-        self.predictor.suggest(corpus, line, buffer.cursor_col)
+        self.predictor
+            .suggest(&corpus, line, buffer.cursor_col, previous, &indent)
     }
 
     fn start_highlight(&mut self) {
@@ -1093,7 +1234,21 @@ pub fn display_width(text: &str) -> usize {
     column
 }
 
-pub fn char_count(text: &str) -> usize {
+pub fn relative_label(root: &Path, path: &Path) -> String {
+    let relative = path
+        .strip_prefix(root)
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.display().to_string());
+    if relative.is_empty() {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or(relative)
+    } else {
+        relative
+    }
+}
+
+fn char_count(text: &str) -> usize {
     text.chars().count()
 }
 
@@ -1174,6 +1329,22 @@ fn spans_match_line(line: &str, spans: &[(Style, String)]) -> bool {
         }
     }
     chars.next().is_none()
+}
+
+fn read_text(path: &Path) -> Result<Vec<String>, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err("file is too large to open".into());
+    }
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if bytes.contains(&0) {
+        return Err("binary file".into());
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "file is not utf-8".to_string())?;
+    Ok(text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect())
 }
 
 #[cfg(test)]
@@ -1300,20 +1471,34 @@ mod tests {
         assert!(buffer.matching_spans(1).is_none());
         assert!(buffer.matching_spans(2).is_some());
     }
-}
 
-fn read_text(path: &Path) -> Result<Vec<String>, String> {
-    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.len() > MAX_FILE_BYTES {
-        return Err("file is too large to open".into());
+    #[test]
+    fn accepts_multiline_prediction_as_separate_lines() {
+        let mut editor = Editor::new(Path::new("."));
+        editor.buffers.push(Buffer {
+            path: PathBuf::from("test.rs"),
+            rel: "test.rs".to_string(),
+            lines: vec!["fn main() {".to_string()],
+            cursor_line: 0,
+            cursor_col: 11,
+            scroll: 0,
+            hscroll: 0,
+            selection: None,
+            dirty: false,
+            external_change: false,
+            highlight_dirty: false,
+            spans: Vec::new(),
+            undo: Vec::new(),
+            undo_group: None,
+        });
+        editor.active = 0;
+        editor.ghost = Some("\n    println!(\"hi\");\n}".to_string());
+
+        assert!(editor.accept_prediction());
+        let buffer = editor.buffer().unwrap();
+        assert_eq!(buffer.lines, ["fn main() {", "    println!(\"hi\");", "}"]);
+        assert_eq!(buffer.cursor_line, 2);
+        assert_eq!(buffer.cursor_col, 1);
+        assert!(buffer.dirty);
     }
-    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if bytes.contains(&0) {
-        return Err("binary file".into());
-    }
-    let text = String::from_utf8(bytes).map_err(|_| "file is not utf-8".to_string())?;
-    Ok(text
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
-        .collect())
 }

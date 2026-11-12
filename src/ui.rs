@@ -8,7 +8,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{
-    App, DiffKind, Entry, Focus, PiState, ResizeEdge, Sidebar, ToolState, Track, TrackKind,
+    App, DiffKind, Entry, FileDialog, Focus, PiState, ResizeEdge, Sidebar, ToolBodyKind, ToolState,
+    Track, TrackKind,
 };
 use crate::editor::{display_width, Buffer};
 use crate::theme;
@@ -81,6 +82,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_agent(frame, agent_rect, app);
     }
     draw_menu(frame, main, app);
+    draw_context_menu(frame, main, app);
+    draw_file_dialog(frame, main, app);
     draw_status(frame, status, app);
 }
 
@@ -528,9 +531,9 @@ fn draw_editor(frame: &mut Frame, rect: Rect, app: &mut App) {
                 width,
                 height: 1,
             };
-            let hovered = app.hover.map_or(false, |(hx, hy)| {
-                hx >= rect.x && hx < rect.x + rect.width && hy == rect.y
-            });
+            let hovered = app
+                .hover
+                .is_some_and(|(hx, hy)| hx >= rect.x && hx < rect.x + rect.width && hy == rect.y);
             let style = if index == app.editor.active {
                 Style::default()
                     .fg(theme::ACCENT)
@@ -589,8 +592,10 @@ fn draw_editor(frame: &mut Frame, rect: Rect, app: &mut App) {
     }
 
     let focused = app.focus == Focus::Editor;
-    app.editor
-        .ensure_visible(text_area.height as usize, text_width);
+    if app.follow_editor_cursor {
+        app.editor
+            .ensure_visible(text_area.height as usize, text_width);
+    }
     let rows = app.editor.visual_rows(text_width);
     let wrap = app.editor.wrap;
 
@@ -600,11 +605,15 @@ fn draw_editor(frame: &mut Frame, rect: Rect, app: &mut App) {
     };
     let cursor = app.editor.cursor_visual(text_width);
     let ghost = app.editor.ghost.as_deref();
+    let ghost_lines: Vec<&str> = ghost
+        .map(|text| text.split('\n').collect())
+        .unwrap_or_default();
     let height = text_area.height as usize;
 
     let mut lines = Vec::with_capacity(height);
-    for row in 0..height {
-        let display_row = buffer.scroll + row;
+    let mut out_row = 0usize;
+    let mut display_row = buffer.scroll;
+    while out_row < height {
         let Some(visual) = rows.get(display_row).copied() else {
             break;
         };
@@ -653,11 +662,11 @@ fn draw_editor(frame: &mut Frame, rect: Rect, app: &mut App) {
             .sum();
         spans.extend(clipped);
 
-        if focused
+        let cursor_row = focused
             && cursor.map(|(cursor_row, _)| cursor_row == display_row) == Some(true)
-            && buffer.selection.is_none()
-        {
-            if let (Some(ghost), Some((_, column))) = (ghost, cursor) {
+            && buffer.selection.is_none();
+        if cursor_row {
+            if let (Some(first), Some((_, column))) = (ghost_lines.first(), cursor) {
                 let start = if wrap {
                     column
                 } else {
@@ -671,7 +680,7 @@ fn draw_editor(frame: &mut Frame, rect: Rect, app: &mut App) {
                         ));
                         used = start;
                     }
-                    let visible = clip_display(ghost, text_width.saturating_sub(start));
+                    let visible = clip_display(first, text_width.saturating_sub(start));
                     used += display_width(&visible);
                     spans.push(Span::styled(
                         visible,
@@ -691,6 +700,38 @@ fn draw_editor(frame: &mut Frame, rect: Rect, app: &mut App) {
             ));
         }
         lines.push(Line::from(spans));
+        out_row += 1;
+
+        if cursor_row && ghost_lines.len() > 1 {
+            for continuation in ghost_lines.iter().skip(1) {
+                if out_row >= height {
+                    break;
+                }
+                let mut spans = vec![Span::styled(
+                    " ".repeat(digits + 1),
+                    Style::default().fg(theme::FAINT).bg(theme::BG),
+                )];
+                let visible = clip_display(continuation, text_width);
+                let used = display_width(&visible);
+                spans.push(Span::styled(
+                    visible,
+                    Style::default()
+                        .fg(theme::DIM)
+                        .bg(theme::BG)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                if used < text_width {
+                    spans.push(Span::styled(
+                        " ".repeat(text_width - used),
+                        Style::default().bg(theme::BG),
+                    ));
+                }
+                lines.push(Line::from(spans));
+                out_row += 1;
+            }
+        }
+
+        display_row += 1;
     }
 
     frame.render_widget(
@@ -770,7 +811,7 @@ fn draw_unsupported(frame: &mut Frame, inner: Rect, header: Rect, app: &mut App,
         return;
     }
     app.ui.unsupported_button = button;
-    let hovered = app.hover.map_or(false, |(x, y)| {
+    let hovered = app.hover.is_some_and(|(x, y)| {
         x >= button.x
             && x < button.x + button.width
             && y >= button.y
@@ -786,6 +827,11 @@ fn draw_unsupported(frame: &mut Frame, inner: Rect, header: Rect, app: &mut App,
             .style(Style::default().bg(theme::BG)),
         button,
     );
+}
+
+fn working_label(elapsed_ms: u128) -> &'static str {
+    const FRAMES: [&str; 4] = ["working", "working.", "working..", "working..."];
+    FRAMES[(elapsed_ms / 280) as usize % FRAMES.len()]
 }
 
 fn draw_agent(frame: &mut Frame, rect: Rect, app: &mut App) {
@@ -818,7 +864,10 @@ fn draw_agent(frame: &mut Frame, rect: Rect, app: &mut App) {
     let (status, status_color) = match &app.pi {
         PiState::Missing => ("not installed", theme::AMBER),
         PiState::Failed(_) => ("failed", theme::RED),
-        PiState::Running(_) if app.agent.busy => ("working", theme::ACCENT),
+        PiState::Running(_) if app.agent.busy => (
+            working_label(app.now.duration_since(app.started_at).as_millis()),
+            theme::ACCENT,
+        ),
         PiState::Running(_) => (app.model.as_deref().unwrap_or("idle"), theme::DIM),
     };
     let title_style = if app.focus == Focus::Agent {
@@ -985,12 +1034,6 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &mut App) {
                     if !lines.is_empty() {
                         lines.push(Line::from(""));
                     }
-                    lines.push(Line::from(Span::styled(
-                        "pi",
-                        Style::default()
-                            .fg(theme::GREEN)
-                            .add_modifier(Modifier::BOLD),
-                    )));
                     if has_thinking {
                         thinking_rows.push((lines.len(), entry_index));
                         let marker = if *thinking_open {
@@ -1029,8 +1072,32 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &mut App) {
                     ToolState::Done => theme::DIM,
                     ToolState::Failed => theme::RED,
                 };
-                for part in wrap_text(&tool.label, width) {
+                let mut label = tool.label.clone();
+                if tool.state == ToolState::Running {
+                    let frames = [".  ", ".. ", "...", " .."];
+                    let frame = (app.now.duration_since(app.started_at).as_millis() / 180) as usize
+                        % frames.len();
+                    label.push(' ');
+                    label.push_str(frames[frame]);
+                }
+                for part in wrap_text(&label, width) {
                     lines.push(Line::from(Span::styled(part, Style::default().fg(color))));
+                }
+                if !tool.body.is_empty() && width > 2 {
+                    for body in &tool.body {
+                        let body_color = match body.kind {
+                            ToolBodyKind::Text => theme::FG,
+                            ToolBodyKind::Add => theme::GREEN,
+                            ToolBodyKind::Del => theme::RED,
+                            ToolBodyKind::Meta => theme::FAINT,
+                        };
+                        for part in wrap_text(&body.text, width - 2) {
+                            lines.push(Line::from(Span::styled(
+                                format!("  {part}"),
+                                Style::default().fg(body_color),
+                            )));
+                        }
+                    }
                 }
             }
             Entry::Note(note) => {
@@ -1161,7 +1228,7 @@ fn valid_tag_name(name: &str) -> bool {
 
 fn draw_agent_input(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Agent;
-    let hovered = app.hover.map_or(false, |(x, y)| {
+    let hovered = app.hover.is_some_and(|(x, y)| {
         x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
     });
     let prompt_style = if focused || hovered {
@@ -1347,7 +1414,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(page) = menu.pages.last() else {
         return;
     };
-    let width = area.width.saturating_sub(8).min(64).max(32).min(area.width);
+    let width = area.width.saturating_sub(8).clamp(32, 64).min(area.width);
     let height = (page.items.len() as u16 + 2).min(area.height);
     if width == 0 || height == 0 {
         return;
@@ -1410,6 +1477,210 @@ fn draw_menu(frame: &mut Frame, area: Rect, app: &mut App) {
         Paragraph::new(lines).style(Style::default().bg(theme::PANEL)),
         inner,
     );
+}
+
+fn draw_context_menu(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.ui.context_menu = Rect::default();
+    let Some(menu) = &app.context_menu else {
+        return;
+    };
+    let label_width = menu
+        .items
+        .iter()
+        .map(|item| display_width(item.label))
+        .max()
+        .unwrap_or(0);
+    let hint_width = menu
+        .items
+        .iter()
+        .map(|item| display_width(item.hint))
+        .max()
+        .unwrap_or(0);
+    let width = (label_width + hint_width + 4).clamp(24, 48) as u16;
+    let width = width.min(area.width);
+    let height = (menu.items.len() as u16 + 2).min(area.height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let max_x = area.x.saturating_add(area.width.saturating_sub(width));
+    let max_y = area.y.saturating_add(area.height.saturating_sub(height));
+    let rect = Rect {
+        x: menu.anchor.0.min(max_x).max(area.x),
+        y: menu.anchor.1.min(max_y).max(area.y),
+        width,
+        height,
+    };
+    app.ui.context_menu = rect;
+    frame.render_widget(Clear, rect);
+
+    let name = menu
+        .target
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| menu.target.display().to_string());
+    let title = format!(
+        " {} ",
+        clip_display(&name, width.saturating_sub(4) as usize)
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(title)
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let width = inner.width as usize;
+    let mut lines = Vec::new();
+    for (index, item) in menu.items.iter().enumerate().take(inner.height as usize) {
+        let selected = index == menu.selected;
+        let bg = if selected {
+            theme::SELECT
+        } else {
+            theme::PANEL
+        };
+        let label_style = Style::default()
+            .fg(if selected { theme::FG } else { theme::DIM })
+            .bg(bg);
+        let hint_style = Style::default()
+            .fg(if selected { theme::FG } else { theme::FAINT })
+            .bg(bg);
+        let hint = clip_display(item.hint, width / 2);
+        let hint_width = display_width(&hint);
+        let label = clip_display(item.label, width.saturating_sub(hint_width + 2));
+        let label_width = display_width(&label);
+        let gap = width.saturating_sub(label_width + hint_width);
+        let mut spans = vec![Span::styled(label, label_style)];
+        if !hint.is_empty() {
+            spans.push(Span::styled(" ".repeat(gap), label_style));
+            spans.push(Span::styled(hint, hint_style));
+        } else if gap > 0 {
+            spans.push(Span::styled(" ".repeat(gap), label_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::PANEL)),
+        inner,
+    );
+}
+
+fn draw_file_dialog(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(dialog) = &app.dialog else {
+        return;
+    };
+    let width = area.width.saturating_sub(8).clamp(36, 64).min(area.width);
+    let height = match dialog {
+        FileDialog::Delete { .. } => 8,
+        FileDialog::Rename { .. } | FileDialog::Create { .. } => 7,
+    }
+    .min(area.height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+
+    let (title, border) = match dialog {
+        FileDialog::Delete { .. } => (" delete ".to_string(), theme::RED),
+        FileDialog::Rename { prompt, .. } | FileDialog::Create { prompt, .. } => {
+            (format!(" {} ", prompt.title), theme::ACCENT)
+        }
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(clip_display(&title, width.saturating_sub(4) as usize))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let width = inner.width as usize;
+    let mut lines = Vec::new();
+    let mut cursor = None;
+    match dialog {
+        FileDialog::Rename { prompt, .. } | FileDialog::Create { prompt, .. } => {
+            lines.push(Line::from(Span::styled(
+                "name",
+                Style::default().fg(theme::FAINT),
+            )));
+            lines.push(Line::default());
+            let shown = clip_display(&prompt.value, width);
+            let shown_width = display_width(&shown);
+            let mut spans = vec![Span::styled(
+                shown,
+                Style::default().fg(theme::FG).bg(theme::SELECT),
+            )];
+            if shown_width < width {
+                spans.push(Span::styled(
+                    " ".repeat(width - shown_width),
+                    Style::default().bg(theme::SELECT),
+                ));
+            }
+            lines.push(Line::from(spans));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "enter confirm  esc cancel",
+                Style::default().fg(theme::FAINT),
+            )));
+            let before: String = prompt.value.chars().take(prompt.cursor).collect();
+            let x = inner.x + (display_width(&before) as u16).min(inner.width.saturating_sub(1));
+            cursor = Some(Position::new(x, inner.y + 2));
+        }
+        FileDialog::Delete {
+            target,
+            is_dir,
+            dirty,
+        } => {
+            let name = target
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| target.display().to_string());
+            lines.push(Line::from(Span::styled(
+                format!("Delete {name}?"),
+                Style::default().fg(theme::FG),
+            )));
+            lines.push(Line::from(Span::styled(
+                if *is_dir {
+                    "The folder and all its contents will be removed."
+                } else {
+                    "The file will be removed."
+                },
+                Style::default().fg(theme::RED),
+            )));
+            lines.push(Line::from(Span::styled(
+                if *dirty {
+                    "Unsaved changes will be lost."
+                } else {
+                    "This cannot be undone."
+                },
+                Style::default().fg(theme::AMBER),
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "enter delete  esc cancel",
+                Style::default().fg(theme::FAINT),
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::PANEL)),
+        inner,
+    );
+    if let Some(position) = cursor {
+        frame.set_cursor_position(position);
+    }
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1747,12 +2018,38 @@ mod tests {
     }
 
     #[test]
+    fn working_label_animates() {
+        assert_eq!(working_label(0), "working");
+        assert_eq!(working_label(280), "working.");
+        assert_eq!(working_label(560), "working..");
+        assert_eq!(working_label(840), "working...");
+        assert_eq!(working_label(1120), "working");
+    }
+
+    #[test]
     fn renders_missing_pi_state() {
         let mut app = App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")), true);
         let text = screen(&mut app);
         assert!(text.contains("pi not installed"));
         assert!(text.contains("https://pi.dev"));
         assert!(text.contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn multiline_ghost_previews_below_cursor() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root.clone(), true);
+        app.open_path(&root.join("Cargo.toml"));
+        app.focus = crate::app::Focus::Editor;
+        if let Some(buffer) = app.editor.buffers.get_mut(app.editor.active) {
+            buffer.cursor_line = 0;
+            buffer.cursor_col = buffer.lines[0].chars().count();
+        }
+        app.editor.ghost = Some("\nsecond preview line\nthird preview line".to_string());
+
+        let text = screen(&mut app);
+        assert!(text.contains("second preview line"));
+        assert!(text.contains("third preview line"));
     }
 
     #[test]
@@ -2204,5 +2501,38 @@ mod tests {
         assert!(text.contains("files"));
         assert!(text.contains("@src/app.rs"));
         assert!(text.contains("@src/tree.rs"));
+    }
+
+    #[test]
+    fn explorer_right_click_renders_menu_and_rename_dialog() {
+        let mut app = App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")), true);
+        let readme = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        app.tree.reveal(&readme);
+        let position = app
+            .tree
+            .visible
+            .iter()
+            .position(|index| app.tree.nodes[*index].path == readme)
+            .expect("README row");
+        screen(&mut app);
+
+        let y = app.ui.tree_body.y + (position - app.tree.scroll) as u16;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: app.ui.tree_body.x + 2,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let text = screen(&mut app);
+        assert!(text.contains("Open in default app"));
+        assert!(text.contains("Copy relative path"));
+
+        for _ in 0..4 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let text = screen(&mut app);
+        assert!(text.contains("rename README.md"));
+        assert!(text.contains("enter confirm"));
     }
 }

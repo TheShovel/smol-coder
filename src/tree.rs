@@ -102,6 +102,12 @@ impl FileTree {
         }
     }
 
+    pub fn toggle_selected(&mut self) {
+        if let Some(&index) = self.visible.get(self.selected) {
+            self.toggle(index);
+        }
+    }
+
     pub fn collapse_selected(&mut self) {
         if let Some(&index) = self.visible.get(self.selected) {
             if self.nodes[index].is_dir && self.nodes[index].expanded {

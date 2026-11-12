@@ -169,36 +169,6 @@ fn resolve_target(path: PathBuf) -> Result<(PathBuf, Option<PathBuf>), String> {
     Err(format!("{} is not a file or folder", path.display()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolves_file_to_parent_and_file() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
-        let (root, file) = resolve_target(path).expect("resolve file");
-        let expected = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .expect("project root");
-        assert_eq!(root, expected);
-        assert_eq!(
-            file.expect("file path")
-                .file_name()
-                .expect("file name")
-                .to_string_lossy(),
-            "README.md"
-        );
-    }
-
-    #[test]
-    fn resolves_folder_without_file() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let (root, file) = resolve_target(path).expect("resolve folder");
-        assert!(root.is_dir());
-        assert!(file.is_none());
-    }
-}
-
 fn set_pointer(shape: PointerShape) {
     let mut out = io::stdout();
     let _ = write!(out, "\x1b]22;{}\x1b\\", shape.css());
@@ -255,6 +225,7 @@ Keys:
 
 Mouse:
   Click           Open a file, folder, or diff; click a tab; focus a pane; place the cursor
+  Right-click     Explorer menu: open, create, rename, delete, or copy paths
   Hover           Change the pointer shape and highlight interactive targets
   Drag divider    Resize the sidebar or agent pane
 
@@ -278,4 +249,34 @@ Git sidebar:
   o               Open the selected file",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_file_to_parent_and_file() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let (root, file) = resolve_target(path).expect("resolve file");
+        let expected = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .expect("project root");
+        assert_eq!(root, expected);
+        assert_eq!(
+            file.expect("file path")
+                .file_name()
+                .expect("file name")
+                .to_string_lossy(),
+            "README.md"
+        );
+    }
+
+    #[test]
+    fn resolves_folder_without_file() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let (root, file) = resolve_target(path).expect("resolve folder");
+        assert!(root.is_dir());
+        assert!(file.is_none());
+    }
 }

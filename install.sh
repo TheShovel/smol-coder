@@ -16,6 +16,50 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'smol install: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
+build_hint() {
+    local hint="install a C compiler and linker (cc)"
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        case "${ID:-}" in
+            arch|endeavouros|manjaro|garuda)
+                hint="sudo pacman -S --needed base-devel"
+                ;;
+            debian|ubuntu|linuxmint|pop)
+                hint="sudo apt-get update && sudo apt-get install -y build-essential"
+                ;;
+            fedora|rhel|centos)
+                hint="sudo dnf groupinstall -y 'Development Tools'"
+                ;;
+            opensuse*|suse*)
+                hint="sudo zypper install -y gcc make"
+                ;;
+            alpine)
+                hint="sudo apk add build-base"
+                ;;
+        esac
+    fi
+    if [ "$(uname -s)" = "Darwin" ]; then
+        hint="xcode-select --install"
+    fi
+    printf '%s\n' "$hint"
+}
+
+check_build_tools() {
+    local missing=()
+    if ! command -v cc >/dev/null 2>&1 \
+        && ! command -v gcc >/dev/null 2>&1 \
+        && ! command -v clang >/dev/null 2>&1; then
+        missing+=("C compiler (cc)")
+    fi
+    if [ "${#missing[@]}" -gt 0 ]; then
+        say "smol is missing build dependencies: ${missing[*]}"
+        say "Install them with:"
+        say "  $(build_hint)"
+        exit 1
+    fi
+}
+
 ROOT=""
 SOURCE="${BASH_SOURCE[0]:-}"
 if [ -n "$SOURCE" ] && [ -f "$SOURCE" ]; then
@@ -49,15 +93,24 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 command -v cargo >/dev/null 2>&1 || die "Rust installation failed"
 
+check_build_tools
+
 say "Building smol"
-(cd "$ROOT" && cargo build --release)
+(cd "$ROOT" && cargo build --release --locked)
 
 say "Removing previous smol installations"
-rm -f "$BIN_DIR/smol" "$BIN_DIR/smol-coder"
-rm -rf "$HOME/.config/smol" "$HOME/.local/share/smol" "$HOME/.local/share/smolcoder" "$HOME/.local/share/smol-coder"
+rm -f "$BIN_DIR/smol" "$BIN_DIR/smol-coder" "$BIN_DIR/smolcoder"
+rm -rf "$HOME/.local/share/smolcoder" "$HOME/.local/share/smol-coder"
 
 mkdir -p "$BIN_DIR"
-install -m 755 "$ROOT/target/release/smol" "$BIN_DIR/smol"
+if command -v install >/dev/null 2>&1; then
+    install -m 755 "$ROOT/target/release/smol" "$BIN_DIR/smol"
+else
+    cp "$ROOT/target/release/smol" "$BIN_DIR/smol"
+    chmod 755 "$BIN_DIR/smol"
+fi
+
+"$BIN_DIR/smol" --version >/dev/null 2>&1 || die "installed smol failed to run"
 
 if ! printf '%s' ":$PATH:" | grep -Fq ":$BIN_DIR:"; then
     if [ -z "$RC_FILE" ]; then
@@ -77,6 +130,15 @@ if ! printf '%s' ":$PATH:" | grep -Fq ":$BIN_DIR:"; then
     say "Open a new terminal or run: source \"$RC_FILE\""
 else
     say "$BIN_DIR is already on PATH"
+fi
+
+resolved="$(command -v smol 2>/dev/null || true)"
+if [ -n "$resolved" ] && [ "$resolved" != "$BIN_DIR/smol" ]; then
+    say "note: another smol is earlier in PATH: $resolved"
+fi
+
+if ! command -v pi >/dev/null 2>&1; then
+    say "pi is not installed; the agent pane will show install instructions."
 fi
 
 say ""

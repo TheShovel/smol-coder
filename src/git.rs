@@ -286,6 +286,65 @@ impl Git {
     }
 }
 
+fn run_git(root: &PathBuf, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|error| format!("git: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let text = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        let line = text.lines().next().unwrap_or("git command failed");
+        Err(line.to_string())
+    }
+}
+
+fn parse_status(bytes: &[u8]) -> Vec<Change> {
+    let tokens: Vec<&[u8]> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut changes = Vec::new();
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let token = tokens[index];
+        index += 1;
+        if token.len() < 4 {
+            continue;
+        }
+        let x = token[0] as char;
+        let y = token[1] as char;
+        let path = String::from_utf8_lossy(&token[3..]).to_string();
+
+        let mut orig = None;
+        if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+            if let Some(previous) = tokens.get(index) {
+                orig = Some(String::from_utf8_lossy(previous).to_string());
+                index += 1;
+            }
+        }
+
+        changes.push(Change {
+            status: format!("{x}{y}"),
+            path,
+            orig,
+        });
+    }
+
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,63 +421,4 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
-}
-
-fn run_git(root: &PathBuf, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .map_err(|error| format!("git: {error}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let text = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        let line = text.lines().next().unwrap_or("git command failed");
-        Err(line.to_string())
-    }
-}
-
-fn parse_status(bytes: &[u8]) -> Vec<Change> {
-    let tokens: Vec<&[u8]> = bytes
-        .split(|byte| *byte == 0)
-        .filter(|token| !token.is_empty())
-        .collect();
-    let mut changes = Vec::new();
-    let mut index = 0;
-
-    while index < tokens.len() {
-        let token = tokens[index];
-        index += 1;
-        if token.len() < 4 {
-            continue;
-        }
-        let x = token[0] as char;
-        let y = token[1] as char;
-        let path = String::from_utf8_lossy(&token[3..]).to_string();
-
-        let mut orig = None;
-        if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
-            if let Some(previous) = tokens.get(index) {
-                orig = Some(String::from_utf8_lossy(previous).to_string());
-                index += 1;
-            }
-        }
-
-        changes.push(Change {
-            status: format!("{x}{y}"),
-            path,
-            orig,
-        });
-    }
-
-    changes
 }
