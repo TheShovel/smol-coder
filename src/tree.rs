@@ -144,6 +144,13 @@ impl FileTree {
         }
     }
 
+    pub fn files(&self) -> Vec<String> {
+        let mut files = Vec::new();
+        collect_files(&self.root, &self.root, &mut files);
+        files.sort_by_key(|path| path.to_lowercase());
+        files
+    }
+
     pub fn reveal(&mut self, path: &Path) {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return;
@@ -289,6 +296,32 @@ impl FileTree {
             let children = self.nodes[index].children.clone();
             for child in children {
                 self.walk(child);
+            }
+        }
+    }
+}
+
+fn collect_files(root: &Path, dir: &Path, files: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() || IGNORED.contains(&name.as_str()) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_files(root, &path, files);
+        } else if file_type.is_file() {
+            if let Ok(relative) = path.strip_prefix(root) {
+                files.push(relative.to_string_lossy().replace('\\', "/"));
             }
         }
     }

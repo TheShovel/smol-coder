@@ -1205,6 +1205,70 @@ fn draw_agent_input(frame: &mut Frame, area: Rect, app: &mut App) {
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::PANEL)),
         area,
     );
+
+    if focused && !app.agent.suggestions.is_empty() {
+        draw_agent_suggestions(frame, area, app);
+    }
+}
+
+fn draw_agent_suggestions(frame: &mut Frame, input: Rect, app: &App) {
+    let top = app.ui.agent.y.saturating_add(1);
+    let available = input.y.saturating_sub(top) as usize;
+    if input.width < 4 || available < 3 {
+        return;
+    }
+    let rows = app
+        .agent
+        .suggestions
+        .len()
+        .min(8)
+        .min(available.saturating_sub(2));
+    if rows == 0 {
+        return;
+    }
+
+    let height = rows as u16 + 2;
+    let popup = Rect {
+        x: input.x,
+        y: input.y.saturating_sub(height),
+        width: input.width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" files ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(popup);
+    let start = app
+        .agent
+        .suggestion_selected
+        .saturating_sub(rows.saturating_sub(1));
+    let lines = app
+        .agent
+        .suggestions
+        .iter()
+        .skip(start)
+        .take(rows)
+        .enumerate()
+        .map(|(offset, path)| {
+            let selected = start + offset == app.agent.suggestion_selected;
+            let style = if selected {
+                Style::default().fg(theme::FG).bg(theme::SELECT)
+            } else {
+                Style::default().fg(theme::DIM).bg(theme::PANEL)
+            };
+            Line::from(Span::styled(format!(" @{path}"), style))
+        })
+        .collect::<Vec<_>>();
+
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::PANEL)),
+        inner,
+    );
 }
 
 fn draw_diff(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -2114,5 +2178,31 @@ mod tests {
         assert!(text.contains("smol --help"));
         assert!(!text.contains("``"));
         assert!(text.contains("fn main()"));
+    }
+
+    #[test]
+    fn file_suggestion_popup_renders_paths() {
+        let mut app = App::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")), true);
+        app.ui.agent = Rect::new(0, 5, 50, 12);
+        app.agent.suggestions = vec!["src/app.rs".to_string(), "src/tree.rs".to_string()];
+        app.agent.suggestion_selected = 1;
+        let input = Rect::new(0, 15, 50, 1);
+
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_agent_suggestions(frame, input, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("files"));
+        assert!(text.contains("@src/app.rs"));
+        assert!(text.contains("@src/tree.rs"));
     }
 }

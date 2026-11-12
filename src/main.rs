@@ -245,9 +245,10 @@ Keys:
   Ctrl+W          Close the current file
   Ctrl+C          Copy the editor selection
   Shift+arrows    Select text
-  Tab             Accept a prediction or indent
+  Tab             Accept a prediction or @ file suggestion, or indent
   BackTab         Dedent
   Enter           Open a file or diff, send a prompt, or commit
+  @               Reference a project file in the agent prompt
   Esc             Stop the agent or close the diff
 
 Mouse:

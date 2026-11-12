@@ -2,7 +2,9 @@
 
 smol is a small terminal IDE for the pi coding agent. It provides a file tree, a syntax-highlighted editor, a git view, and an agent pane.
 
-It is built to stay small: the Linux x86_64 release binary is 4.0 MB, and an idle session uses about 5.6 MiB of RSS and 0.2% CPU without a pi subprocess.
+![Screenie](images/screenie.png)
+
+It is built to stay small: the Linux x86_64 release binary is 4.1 MB, and an idle session uses about 5.9 MiB of RSS and 0.2% CPU without a pi subprocess.
 
 ## Requirements
 
@@ -46,12 +48,14 @@ Run `smol --help` for all options.
 | `Ctrl+Left`, `Ctrl+Right` | Move by word |
 | `Ctrl+Home`, `Ctrl+End` | Start or end of file |
 | `Shift+arrows` | Select text |
-| `Tab` | Accept a prediction or indent |
+| `Tab` | Accept a prediction or @ file suggestion, or indent |
 | `BackTab` | Dedent |
 | `Enter` | Open a file or diff, send a prompt, or commit |
 | `Esc` | Stop the agent, close a diff, or leave the git input |
 
-The file tree also supports arrows and `h`, `j`, `k`, `l`. Click files and folders, drag pane dividers to resize, and drag in the editor to select text. Copy uses the terminal's OSC 52 clipboard support.
+The file tree also supports arrows and `h`, `j`, `k`, `l`. It refreshes automatically when files and folders change. Click files and folders, drag pane dividers to resize, and drag in the editor to select text. Copy uses the terminal's OSC 52 clipboard support.
+
+Type `@` in the agent input to reference a project file. A list filters paths as you type; use Up/Down and Tab or Enter to insert one.
 
 The command menu groups actions into `Files`, `Settings`, `LLM commands`, and `Git` submenus.
 

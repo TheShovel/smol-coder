@@ -202,6 +202,8 @@ pub struct Agent {
     pub input_cursor: usize,
     pub scroll: usize,
     pub busy: bool,
+    pub suggestions: Vec<String>,
+    pub suggestion_selected: usize,
     streaming: Option<usize>,
     tools: HashMap<String, usize>,
 }
@@ -214,6 +216,8 @@ impl Agent {
             input_cursor: 0,
             scroll: 0,
             busy: false,
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
             streaming: None,
             tools: HashMap::new(),
         }
@@ -354,6 +358,12 @@ impl Agent {
     fn clear_input(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.clear_suggestions();
+    }
+
+    fn clear_suggestions(&mut self) {
+        self.suggestions.clear();
+        self.suggestion_selected = 0;
     }
 
     fn insert_input(&mut self, ch: char) {
@@ -397,6 +407,92 @@ impl Agent {
         self.input_cursor = self.input.chars().count();
     }
 
+    fn reference_query(&self) -> Option<(usize, String)> {
+        let chars: Vec<char> = self.input.chars().collect();
+        let end = self.input_cursor.min(chars.len());
+        let mut start = None;
+        for index in (0..end).rev() {
+            match chars[index] {
+                '@' => {
+                    if index == 0 || chars[index - 1].is_whitespace() {
+                        start = Some(index);
+                    }
+                    break;
+                }
+                ch if ch.is_whitespace() => break,
+                _ => {}
+            }
+        }
+        let start = start?;
+        Some((start, chars[start + 1..end].iter().collect()))
+    }
+
+    fn update_suggestions(&mut self, files: &[String]) {
+        let Some((_, query)) = self.reference_query() else {
+            self.clear_suggestions();
+            return;
+        };
+        let query = query.to_lowercase();
+        let mut matches: Vec<(u8, String)> = files
+            .iter()
+            .filter_map(|path| {
+                let lower = path.to_lowercase();
+                if !lower.contains(&query) {
+                    return None;
+                }
+                let name = lower.rsplit('/').next().unwrap_or(&lower);
+                let rank = if query.is_empty() || name.starts_with(&query) {
+                    0
+                } else if lower.starts_with(&query) {
+                    1
+                } else if name.contains(&query) {
+                    2
+                } else {
+                    3
+                };
+                Some((rank, path.clone()))
+            })
+            .collect();
+        matches.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        });
+        self.suggestions = matches.into_iter().take(8).map(|(_, path)| path).collect();
+        if self.suggestion_selected >= self.suggestions.len() {
+            self.suggestion_selected = self.suggestions.len().saturating_sub(1);
+        }
+    }
+
+    fn move_suggestion(&mut self, delta: isize) {
+        if self.suggestions.is_empty() {
+            return;
+        }
+        let next = self.suggestion_selected as isize + delta;
+        self.suggestion_selected =
+            next.clamp(0, self.suggestions.len().saturating_sub(1) as isize) as usize;
+    }
+
+    fn accept_suggestion(&mut self) -> bool {
+        if self.suggestions.is_empty() {
+            return false;
+        }
+        let Some((start, _)) = self.reference_query() else {
+            self.clear_suggestions();
+            return false;
+        };
+        let index = self
+            .suggestion_selected
+            .min(self.suggestions.len().saturating_sub(1));
+        let replacement = format!("@{} ", self.suggestions[index]);
+        let mut chars: Vec<char> = self.input.chars().collect();
+        let end = self.input_cursor.min(chars.len());
+        chars.splice(start..end, replacement.chars());
+        self.input = chars.into_iter().collect();
+        self.input_cursor = start + replacement.chars().count();
+        self.clear_suggestions();
+        true
+    }
+
     fn scroll_by(&mut self, delta: isize) {
         let next = self.scroll as isize + delta;
         self.scroll = next.max(0) as usize;
@@ -430,6 +526,7 @@ struct PendingTool {
 pub struct App {
     pub root: PathBuf,
     pub tree: FileTree,
+    pub project_files: Vec<String>,
     pub editor: Editor,
     pub agent: Agent,
     pub git: Git,
@@ -441,6 +538,7 @@ pub struct App {
     pub tracks: Vec<Track>,
     pub ui: UiRects,
     pub now: Instant,
+    last_tree_refresh: Instant,
     pub model: Option<String>,
     pub diff: Option<DiffView>,
     pub menu: Option<CommandMenu>,
@@ -467,6 +565,7 @@ pub struct App {
 impl App {
     pub fn new(root: PathBuf, force_no_pi: bool) -> Self {
         let tree = FileTree::new(&root);
+        let project_files = tree.files();
         let editor = Editor::new(&root);
         let git = Git::new(&root);
         let pi = if force_no_pi {
@@ -491,6 +590,7 @@ impl App {
         Self {
             root,
             tree,
+            project_files,
             editor,
             agent: Agent::new(),
             git,
@@ -502,6 +602,7 @@ impl App {
             tracks: Vec::new(),
             ui: UiRects::default(),
             now: Instant::now(),
+            last_tree_refresh: Instant::now(),
             model: None,
             diff: None,
             menu: None,
@@ -921,7 +1022,7 @@ impl App {
             self.set_track_end(path.clone(), kind, start, end);
 
             if kind == TrackKind::Write {
-                self.tree.refresh();
+                self.refresh_tree();
                 self.reload_after_tool(&path);
             }
         }
@@ -1021,6 +1122,10 @@ impl App {
     pub fn tick(&mut self) {
         self.now = Instant::now();
 
+        if self.last_tree_refresh.elapsed() >= Duration::from_secs(2) {
+            self.refresh_tree();
+        }
+
         let clear_status = self
             .status
             .as_ref()
@@ -1055,6 +1160,20 @@ impl App {
         {
             self.git.refresh();
         }
+    }
+
+    fn refresh_tree(&mut self) {
+        self.tree.refresh();
+        self.project_files = self.tree.files();
+        if !self.agent.suggestions.is_empty() {
+            self.agent.update_suggestions(&self.project_files);
+        }
+        self.last_tree_refresh = Instant::now();
+    }
+
+    fn refresh_agent_suggestions(&mut self) {
+        self.agent.suggestion_selected = 0;
+        self.agent.update_suggestions(&self.project_files);
     }
 
     pub fn send_prompt(&mut self) {
@@ -1865,7 +1984,7 @@ impl App {
             Ok((message, path)) => {
                 self.set_status(message);
                 self.reload_after_tool(&path);
-                self.tree.refresh();
+                self.refresh_tree();
             }
             Err(error) => self.set_status(error),
         }
@@ -1944,24 +2063,56 @@ impl App {
 
     fn handle_agent_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool) {
         let running = matches!(self.pi, PiState::Running(_));
+        let suggestions = !self.agent.suggestions.is_empty();
         match key.code {
             KeyCode::PageUp => self.agent.scroll_by(5),
             KeyCode::PageDown => self.agent.scroll_by(-5),
             KeyCode::Esc => {
-                if self.agent.busy {
+                if suggestions {
+                    self.agent.clear_suggestions();
+                } else if self.agent.busy {
                     self.abort_agent();
                 }
             }
+            KeyCode::Up if suggestions => self.agent.move_suggestion(-1),
+            KeyCode::Down if suggestions => self.agent.move_suggestion(1),
+            KeyCode::Tab if suggestions => {
+                self.agent.accept_suggestion();
+            }
+            KeyCode::Enter if suggestions => {
+                self.agent.accept_suggestion();
+            }
             KeyCode::Enter => self.send_prompt(),
             _ if !running => {}
-            KeyCode::Backspace => self.agent.backspace_input(),
-            KeyCode::Delete => self.agent.delete_input(),
-            KeyCode::Left => self.agent.move_input(-1),
-            KeyCode::Right => self.agent.move_input(1),
-            KeyCode::Home => self.agent.input_home(),
-            KeyCode::End => self.agent.input_end(),
+            KeyCode::Backspace => {
+                self.agent.backspace_input();
+                self.refresh_agent_suggestions();
+            }
+            KeyCode::Delete => {
+                self.agent.delete_input();
+                self.refresh_agent_suggestions();
+            }
+            KeyCode::Left => {
+                self.agent.move_input(-1);
+                self.refresh_agent_suggestions();
+            }
+            KeyCode::Right => {
+                self.agent.move_input(1);
+                self.refresh_agent_suggestions();
+            }
+            KeyCode::Home => {
+                self.agent.input_home();
+                self.refresh_agent_suggestions();
+            }
+            KeyCode::End => {
+                self.agent.input_end();
+                self.refresh_agent_suggestions();
+            }
             KeyCode::Char('u') if ctrl => self.agent.clear_input(),
-            KeyCode::Char(ch) if !ctrl && !alt => self.agent.insert_input(ch),
+            KeyCode::Char(ch) if !ctrl && !alt => {
+                self.agent.insert_input(ch);
+                self.refresh_agent_suggestions();
+            }
             _ => {}
         }
     }
@@ -2043,6 +2194,14 @@ impl App {
         }
 
         if self.focus == Focus::Agent {
+            if !self.agent.suggestions.is_empty() {
+                return if full {
+                    "up/down select  tab/enter complete  esc close"
+                } else {
+                    "tab complete  esc close"
+                }
+                .to_string();
+            }
             return match &self.pi {
                 PiState::Running(_) if self.agent.busy => {
                     if full {
@@ -2161,6 +2320,7 @@ impl App {
                 for ch in text.chars() {
                     self.agent.insert_input(ch);
                 }
+                self.refresh_agent_suggestions();
             }
             Focus::Tree => {}
         }
@@ -2252,6 +2412,7 @@ impl App {
                     }
                     if inside(self.ui.agent_input, x, y) {
                         self.agent.input_end();
+                        self.refresh_agent_suggestions();
                     }
                 }
             }
@@ -3027,5 +3188,39 @@ mod tests {
         assert!(app.agent_hidden);
         app.set_agent_hidden(false);
         assert!(!app.agent_hidden);
+    }
+
+    #[test]
+    fn tree_refresh_picks_up_new_files_and_folders() {
+        let root = std::env::temp_dir().join(format!("smol-tree-refresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test project");
+        let mut app = App::new(root.clone(), true);
+
+        fs::create_dir(root.join("new")).expect("create folder");
+        fs::write(root.join("new/file.txt"), "hello").expect("write file");
+        app.last_tree_refresh = Instant::now() - Duration::from_secs(3);
+        app.tick();
+
+        assert!(app.tree.nodes.iter().any(|node| node.name == "new"));
+        assert!(app.project_files.iter().any(|path| path == "new/file.txt"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn at_reference_completes_project_file() {
+        let mut app = test_app();
+        app.agent.input = "inspect @app".to_string();
+        app.agent.input_cursor = app.agent.input.chars().count();
+        app.refresh_agent_suggestions();
+        assert_eq!(
+            app.agent.suggestions.first().map(String::as_str),
+            Some("src/app.rs")
+        );
+
+        assert!(app.agent.accept_suggestion());
+        assert_eq!(app.agent.input, "inspect @src/app.rs ");
+        assert_eq!(app.agent.input_cursor, app.agent.input.chars().count());
+        assert!(app.agent.suggestions.is_empty());
     }
 }
