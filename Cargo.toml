@@ -1,0 +1,17 @@
+[package]
+name = "smol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "A small terminal IDE for the pi coding agent"
+license = "AGPL-3.0-only"
+
+[dependencies]
+ratatui = "0.29"
+serde_json = "1"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "plist-load", "yaml-load"] }
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true
