@@ -1025,6 +1025,9 @@ impl App {
         };
         let model_pref_file = config_file("model.json");
         let model_pref = model_pref_file.as_deref().and_then(load_model_pref);
+        // The todo list belongs to the run that wrote it; a restart starts a
+        // fresh list instead of showing the previous run's tasks.
+        let _ = fs::remove_file(root.join(".smol").join("todo.md"));
         let instructions = crate::prompt::write_instructions();
         let pi_path = if force_no_pi { None } else { find_pi() };
 
@@ -6545,6 +6548,20 @@ done"#
         assert!(sent.contains("\"modelId\":\"claude-sonnet-4\""), "got: {sent}");
         let saved = load_model_pref(&root.join("model.json")).expect("saved model");
         assert_eq!(saved.id, "claude-sonnet-4");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restarting_clears_the_todo_list() {
+        let root = temp_root("smol-todo-reset");
+        let file = root.join(".smol").join("todo.md");
+        fs::create_dir_all(file.parent().expect("todo dir")).expect("mkdir");
+        fs::write(&file, "[ ] old task\n[>] another\n").expect("write todo");
+
+        let app = App::new(root.clone(), true);
+
+        assert!(!file.exists(), "a restart removes the previous list");
+        assert!(app.todo.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
