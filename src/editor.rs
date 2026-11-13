@@ -143,6 +143,11 @@ impl Editor {
         self.buffers.get(self.active)
     }
 
+    /// Highlights arbitrary text with the same engine and theme as the editor.
+    pub fn highlight_lines(&self, path: &Path, lines: &[String]) -> Vec<Vec<(Style, String)>> {
+        self.highlighter.highlight(path, lines)
+    }
+
     pub fn find_buffer(&self, path: &Path) -> Option<usize> {
         self.buffers.iter().position(|buffer| buffer.path == path)
     }

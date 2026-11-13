@@ -833,11 +833,6 @@ fn draw_unsupported(frame: &mut Frame, inner: Rect, header: Rect, app: &mut App,
     );
 }
 
-fn working_label(elapsed_ms: u128) -> &'static str {
-    const FRAMES: [&str; 4] = ["working", "working.", "working..", "working..."];
-    FRAMES[(elapsed_ms / 280) as usize % FRAMES.len()]
-}
-
 /// Most task rows the todo panel may show; the rest are implied by the
 /// `done/total` heading.
 const TODO_MAX_ROWS: usize = 8;
@@ -990,10 +985,7 @@ fn draw_agent(frame: &mut Frame, rect: Rect, app: &mut App) {
     let (status, status_color) = match &app.pi {
         PiState::Missing => ("not installed", theme::AMBER),
         PiState::Failed(_) => ("failed", theme::RED),
-        PiState::Running(_) if app.agent.busy => (
-            working_label(app.now.duration_since(app.started_at).as_millis()),
-            theme::ACCENT,
-        ),
+        PiState::Running(_) if app.agent.busy => ("working", theme::ACCENT),
         PiState::Running(_) => (app.model.as_deref().unwrap_or("idle"), theme::DIM),
     };
     let title_style = if app.focus == Focus::Agent {
@@ -1231,11 +1223,24 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &mut App) {
                             ToolBodyKind::Del => theme::RED,
                             ToolBodyKind::Meta => theme::FAINT,
                         };
-                        for part in wrap_text(&body.text, width - 2) {
-                            lines.push(Line::from(Span::styled(
-                                format!("  {part}"),
-                                Style::default().fg(body_color),
-                            )));
+                        match &body.spans {
+                            Some(spans) => {
+                                for parts in wrap_spans(spans, width - 2) {
+                                    let mut out = vec![Span::raw("  ")];
+                                    out.extend(parts.into_iter().map(|(style, text)| {
+                                        Span::styled(text, style)
+                                    }));
+                                    lines.push(Line::from(out));
+                                }
+                            }
+                            None => {
+                                for part in wrap_text(&body.text, width - 2) {
+                                    lines.push(Line::from(Span::styled(
+                                        format!("  {part}"),
+                                        Style::default().fg(body_color),
+                                    )));
+                                }
+                            }
                         }
                     }
                 }
@@ -2468,6 +2473,50 @@ fn clip_from(text: &str, start: usize, width: usize) -> String {
     out
 }
 
+/// Wraps styled spans the same way `wrap_text` wraps plain text, keeping each
+/// character's style across wrapped rows.
+fn wrap_spans(spans: &[(Style, String)], width: usize) -> Vec<Vec<(Style, String)>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<Vec<(Style, String)>> = Vec::new();
+    let mut line: Vec<(Style, String)> = Vec::new();
+    let mut used = 0;
+    for (style, text) in spans {
+        for ch in text.chars() {
+            if ch == '\t' {
+                for _ in 0..4 {
+                    push_span_char(&mut lines, &mut line, &mut used, *style, ' ', width);
+                }
+            } else {
+                push_span_char(&mut lines, &mut line, &mut used, *style, ch, width);
+            }
+        }
+    }
+    lines.push(line);
+    lines
+}
+
+fn push_span_char(
+    lines: &mut Vec<Vec<(Style, String)>>,
+    line: &mut Vec<(Style, String)>,
+    used: &mut usize,
+    style: Style,
+    ch: char,
+    width: usize,
+) {
+    let char_width = ch.width().unwrap_or(0);
+    if *used + char_width > width && !line.is_empty() {
+        lines.push(std::mem::take(line));
+        *used = 0;
+    }
+    match line.last_mut() {
+        Some((last, text)) if *last == style => text.push(ch),
+        _ => line.push((style, ch.to_string())),
+    }
+    *used += char_width;
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return Vec::new();
@@ -2529,12 +2578,19 @@ mod tests {
     }
 
     #[test]
-    fn working_label_animates() {
-        assert_eq!(working_label(0), "working");
-        assert_eq!(working_label(280), "working.");
-        assert_eq!(working_label(560), "working..");
-        assert_eq!(working_label(840), "working...");
-        assert_eq!(working_label(1120), "working");
+    fn wraps_styled_spans_without_losing_style() {
+        let red = Style::default().fg(theme::RED);
+        let green = Style::default().fg(theme::GREEN);
+        let spans = vec![(red, "abc".to_string()), (green, "def".to_string())];
+        let lines = wrap_spans(&spans, 4);
+        let text = |line: &Vec<(Style, String)>| {
+            line.iter().map(|(_, text)| text.as_str()).collect::<String>()
+        };
+        assert_eq!(lines.len(), 2);
+        assert_eq!(text(&lines[0]), "abcd");
+        assert_eq!(lines[0].last().expect("span").0.fg, Some(theme::GREEN));
+        assert_eq!(text(&lines[1]), "ef");
+        assert_eq!(lines[1][0].0.fg, Some(theme::GREEN));
     }
 
     #[test]

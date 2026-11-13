@@ -12,9 +12,11 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use serde_json::{json, Value};
 
 use crate::editor::Editor;
+use crate::theme;
 use crate::git::Git;
 use crate::pi::{find_pi, PiClient, PiEvent};
 use crate::todo;
@@ -134,6 +136,9 @@ pub enum ToolBodyKind {
 pub struct ToolBodyLine {
     pub kind: ToolBodyKind,
     pub text: String,
+    /// Syntax-highlighted spans for the line, prefix included. `None` means
+    /// the renderer should use the plain color for `kind`.
+    pub spans: Option<Vec<(Style, String)>>,
 }
 
 pub enum Entry {
@@ -540,6 +545,14 @@ pub struct Agent {
     pub suggestion_selected: usize,
     streaming: Option<usize>,
     tools: HashMap<String, usize>,
+    /// Tool calls the model is still writing, keyed by content index.
+    tool_streams: HashMap<u64, ToolStream>,
+}
+
+struct ToolStream {
+    entry: usize,
+    name: String,
+    args: String,
 }
 
 impl Agent {
@@ -554,6 +567,7 @@ impl Agent {
             suggestion_selected: 0,
             streaming: None,
             tools: HashMap::new(),
+            tool_streams: HashMap::new(),
         }
     }
 
@@ -678,7 +692,64 @@ impl Agent {
         let index = self.entries.len();
         self.entries
             .push(Entry::Tool(ToolEntry { label, state, body }));
-        self.tools.insert(id.to_string(), index);
+        if !id.is_empty() {
+            self.tools.insert(id.to_string(), index);
+        }
+        self.scroll = 0;
+    }
+
+    /// Adds a tool the model has started writing, so it shows up live while
+    /// the arguments (a whole file, for `write`) are still streaming in.
+    fn stream_tool_start(&mut self, index: u64, id: &str, name: &str, label: String) {
+        let entry = self.entries.len();
+        self.push_tool(id, label, ToolState::Running, Vec::new());
+        self.tool_streams.insert(
+            index,
+            ToolStream {
+                entry,
+                name: name.to_string(),
+                args: String::new(),
+            },
+        );
+    }
+
+    /// Yields the entry and name for a live tool stream while the caller
+    /// appends the next argument fragment.
+    fn stream_tool_entry(&mut self, index: u64) -> Option<(usize, String)> {
+        let stream = self.tool_streams.get_mut(&index)?;
+        Some((stream.entry, stream.name.clone()))
+    }
+
+    fn stream_tool_args(&mut self, index: u64) -> Option<&mut String> {
+        self.tool_streams.get_mut(&index).map(|stream| &mut stream.args)
+    }
+
+    fn stream_tool_done(&mut self, index: u64) -> Option<(usize, String)> {
+        let stream = self.tool_streams.remove(&index)?;
+        Some((stream.entry, stream.name))
+    }
+
+    /// Marks a tool call that was cut off mid-generation (usually by a stop)
+    /// as failed so it does not spin forever.
+    fn fail_tool_streams(&mut self) {
+        for (_, stream) in self.tool_streams.drain() {
+            if let Some(Entry::Tool(tool)) = self.entries.get_mut(stream.entry) {
+                tool.state = ToolState::Failed;
+            }
+        }
+    }
+
+    fn set_tool(&mut self, id: &str, label: String, body: Vec<ToolBodyLine>) {
+        match self.tools.get(id).copied() {
+            Some(index) => {
+                if let Some(Entry::Tool(tool)) = self.entries.get_mut(index) {
+                    tool.label = label;
+                    tool.body = body;
+                    tool.state = ToolState::Running;
+                }
+            }
+            None => self.push_tool(id, label, ToolState::Running, body),
+        }
         self.scroll = 0;
     }
 
@@ -840,6 +911,7 @@ impl Agent {
         self.busy = false;
         self.streaming = None;
         self.tools.clear();
+        self.tool_streams.clear();
     }
 
     fn last_assistant(&self) -> Option<String> {
@@ -1158,6 +1230,21 @@ impl App {
                             self.agent.thinking_final(content.to_string());
                         }
                     }
+                    "toolcall_start" => {
+                        if let Some(event) = event {
+                            self.on_tool_call_start(event);
+                        }
+                    }
+                    "toolcall_delta" => {
+                        if let Some(event) = event {
+                            self.on_tool_call_delta(event);
+                        }
+                    }
+                    "toolcall_end" => {
+                        if let Some(event) = event {
+                            self.on_tool_call_end(event);
+                        }
+                    }
                     "error" => {
                         if let Some(error) = event
                             .and_then(|event| event.get("error"))
@@ -1187,6 +1274,7 @@ impl App {
             "tool_execution_end" => self.on_tool_end(&value),
             "agent_start" => self.agent.busy = true,
             "agent_settled" => {
+                self.agent.fail_tool_streams();
                 self.agent.busy = false;
                 self.agent.scroll = 0;
                 self.refresh_todo();
@@ -1434,6 +1522,82 @@ impl App {
         }
     }
 
+    fn on_tool_call_start(&mut self, event: &Value) {
+        let index = event
+            .get("contentIndex")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
+        let name = event
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let label = tool_label(name, &Value::Null, None, &self.root)
+            .trim_end()
+            .to_string();
+        self.agent.stream_tool_start(index, id, name, label);
+    }
+
+    fn on_tool_call_delta(&mut self, event: &Value) {
+        let index = event
+            .get("contentIndex")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let delta = event.get("delta").and_then(Value::as_str).unwrap_or_default();
+        let Some((entry, name)) = self.agent.stream_tool_entry(index) else {
+            return;
+        };
+        if let Some(args) = self.agent.stream_tool_args(index) {
+            args.push_str(delta);
+        }
+        let partial = self
+            .agent
+            .tool_streams
+            .get(&index)
+            .and_then(|stream| partial_json(&stream.args))
+            .unwrap_or(Value::Null);
+        let path = resolved_tool_path(&partial, &self.root);
+        let label = tool_label(&name, &partial, path.as_deref(), &self.root);
+        let mut body = tool_body_streaming(&name, &partial);
+        self.highlight_tool_body(path.as_deref(), &mut body);
+        if let Some(Entry::Tool(tool)) = self.agent.entries.get_mut(entry) {
+            tool.label = label;
+            tool.body = body;
+        }
+        self.agent.scroll = 0;
+    }
+
+    fn on_tool_call_end(&mut self, event: &Value) {
+        let index = event
+            .get("contentIndex")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let args = event
+            .pointer("/toolCall/arguments")
+            .cloned()
+            .filter(|args| !args.is_null())
+            .or_else(|| {
+                self.agent
+                    .tool_streams
+                    .get(&index)
+                    .and_then(|stream| partial_json(&stream.args))
+            })
+            .unwrap_or(Value::Null);
+        let Some((entry, name)) = self.agent.stream_tool_done(index) else {
+            return;
+        };
+        let path = resolved_tool_path(&args, &self.root);
+        let label = tool_label(&name, &args, path.as_deref(), &self.root);
+        let mut body = tool_body(&name, &args);
+        self.highlight_tool_body(path.as_deref(), &mut body);
+        if let Some(Entry::Tool(tool)) = self.agent.entries.get_mut(entry) {
+            tool.label = label;
+            tool.body = body;
+            tool.state = ToolState::Running;
+        }
+        self.agent.scroll = 0;
+    }
+
     fn on_tool_start(&mut self, value: &Value) {
         let id = value
             .get("toolCallId")
@@ -1452,12 +1616,16 @@ impl App {
             _ => None,
         };
         let label = tool_label(name, &args, path.as_deref(), &self.root);
-        let body = tool_body(name, &args);
-        self.agent.push_tool(&id, label, ToolState::Running, body);
+        let mut body = tool_body(name, &args);
+        self.highlight_tool_body(path.as_deref(), &mut body);
+        self.agent.set_tool(&id, label, body);
 
         let Some(path) = path else {
             return;
         };
+        if self.is_todo_file(&path) {
+            return;
+        }
 
         let before = fs::read_to_string(&path).ok();
         let (start, end) = if kind == Some(TrackKind::Read) {
@@ -1535,6 +1703,54 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Adds syntax highlighting to a tool body's code lines, using the file
+    /// extension to pick the syntax. Runs of the same kind are highlighted
+    /// together so multiline constructs keep their state.
+    fn highlight_tool_body(&self, path: Option<&Path>, body: &mut [ToolBodyLine]) {
+        let Some(path) = path else {
+            return;
+        };
+        let mut index = 0;
+        while index < body.len() {
+            let kind = body[index].kind;
+            if !matches!(
+                kind,
+                ToolBodyKind::Text | ToolBodyKind::Add | ToolBodyKind::Del
+            ) {
+                index += 1;
+                continue;
+            }
+            let mut end = index + 1;
+            while end < body.len() && body[end].kind == kind {
+                end += 1;
+            }
+            let codes: Vec<String> = body[index..end]
+                .iter()
+                .map(|line| line.text.chars().skip(2).collect())
+                .collect();
+            let highlighted = self.editor.highlight_lines(path, &codes);
+            let color = match kind {
+                ToolBodyKind::Add => theme::GREEN,
+                ToolBodyKind::Del => theme::RED,
+                _ => theme::FG,
+            };
+            for (line, spans) in body[index..end].iter_mut().zip(highlighted) {
+                let prefix: String = line.text.chars().take(2).collect();
+                let mut out = vec![(Style::default().fg(color), prefix)];
+                out.extend(spans);
+                line.spans = Some(out);
+            }
+            index = end;
+        }
+    }
+
+    /// The todo file belongs to the todo panel: its reads and writes should
+    /// not highlight or pull the file into the editor.
+    fn is_todo_file(&self, path: &Path) -> bool {
+        let todo = self.root.join(".smol").join("todo.md");
+        path.components().eq(todo.components())
     }
 
     fn follow_file(&mut self, path: &Path) {
@@ -2075,7 +2291,8 @@ impl App {
                     for (id, name, args) in calls {
                         let path = tool_path(&args).map(|raw| self.resolve(&raw));
                         let label = tool_label(&name, &args, path.as_deref(), &self.root);
-                        let body = tool_body(&name, &args);
+                        let mut body = tool_body(&name, &args);
+                        self.highlight_tool_body(path.as_deref(), &mut body);
                         self.agent.push_tool(&id, label, ToolState::Running, body);
                     }
                 }
@@ -4784,6 +5001,202 @@ fn tool_path(args: &Value) -> Option<String> {
     None
 }
 
+fn resolved_tool_path(args: &Value, root: &Path) -> Option<PathBuf> {
+    tool_path(args).map(|raw| {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+    })
+}
+
+/// Parses the part of a JSON document that has arrived so far. A truncated
+/// string or container yields the partial value instead of failing, so tool
+/// arguments can be shown while the model is still writing them.
+fn partial_json(text: &str) -> Option<Value> {
+    let mut parser = PartialJson { text, pos: 0 };
+    parser.value()
+}
+
+struct PartialJson<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl PartialJson<'_> {
+    fn peek(&self) -> Option<char> {
+        self.text[self.pos..].chars().next()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let ch = self.peek()?;
+        self.pos += ch.len_utf8();
+        Some(ch)
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(ch) if ch.is_ascii_whitespace()) {
+            self.pos += 1;
+        }
+    }
+
+    fn value(&mut self) -> Option<Value> {
+        self.skip_ws();
+        match self.peek()? {
+            '{' => self.object(),
+            '[' => self.array(),
+            '"' => self.string().map(Value::String),
+            't' => self.literal("true", Value::Bool(true)),
+            'f' => self.literal("false", Value::Bool(false)),
+            'n' => self.literal("null", Value::Null),
+            _ => self.number(),
+        }
+    }
+
+    fn object(&mut self) -> Option<Value> {
+        self.bump();
+        let mut map = serde_json::Map::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some('}') {
+                self.bump();
+                break;
+            }
+            if self.peek() != Some('"') {
+                break;
+            }
+            let Some(key) = self.string() else { break };
+            self.skip_ws();
+            if self.peek() != Some(':') {
+                break;
+            }
+            self.bump();
+            let Some(value) = self.value() else { break };
+            map.insert(key, value);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.bump();
+                }
+                Some('}') => {
+                    self.bump();
+                    break;
+                }
+                _ => break,
+            }
+        }
+        Some(Value::Object(map))
+    }
+
+    fn array(&mut self) -> Option<Value> {
+        self.bump();
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(']') {
+                self.bump();
+                break;
+            }
+            let Some(value) = self.value() else { break };
+            items.push(value);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.bump();
+                }
+                Some(']') => {
+                    self.bump();
+                    break;
+                }
+                _ => break,
+            }
+        }
+        Some(Value::Array(items))
+    }
+
+    fn string(&mut self) -> Option<String> {
+        if self.peek() != Some('"') {
+            return None;
+        }
+        self.bump();
+        let mut out = String::new();
+        while let Some(ch) = self.bump() {
+            match ch {
+                '"' => return Some(out),
+                '\\' => {
+                    let Some(escape) = self.bump() else { break };
+                    match escape {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        '/' => out.push('/'),
+                        'b' => out.push('\u{8}'),
+                        'f' => out.push('\u{c}'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'u' => {
+                            let mut code = 0u32;
+                            let mut complete = true;
+                            for _ in 0..4 {
+                                match self.bump().and_then(|ch| ch.to_digit(16)) {
+                                    Some(digit) => code = code * 16 + digit,
+                                    None => {
+                                        complete = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !complete {
+                                break;
+                            }
+                            if let Some(ch) = char::from_u32(code) {
+                                out.push(ch);
+                            }
+                        }
+                        other => out.push(other),
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        Some(out)
+    }
+
+    fn literal(&mut self, word: &str, value: Value) -> Option<Value> {
+        let rest = &self.text[self.pos..];
+        if rest.len() < word.len() && word.starts_with(rest) {
+            self.pos = self.text.len();
+            return Some(value);
+        }
+        if rest.starts_with(word) {
+            self.pos += word.len();
+            return Some(value);
+        }
+        None
+    }
+
+    fn number(&mut self) -> Option<Value> {
+        let start = self.pos;
+        while matches!(self.peek(), Some(ch) if ch.is_ascii_digit() || matches!(ch, '-' | '+' | '.' | 'e' | 'E'))
+        {
+            self.bump();
+        }
+        let raw = &self.text[start..self.pos];
+        if let Ok(number) = raw.parse::<i64>() {
+            return Some(Value::from(number));
+        }
+        if let Ok(number) = raw.parse::<u64>() {
+            return Some(Value::from(number));
+        }
+        raw.parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number)
+    }
+}
+
 fn tool_label(name: &str, args: &Value, path: Option<&Path>, root: &Path) -> String {
     let display = path
         .map(|path| display_path(path, root))
@@ -4836,6 +5249,16 @@ fn tool_label(name: &str, args: &Value, path: Option<&Path>, root: &Path) -> Str
 const MAX_TOOL_BODY_LINES: usize = 80;
 
 fn tool_body(name: &str, args: &Value) -> Vec<ToolBodyLine> {
+    tool_body_lines(name, args, false)
+}
+
+/// While the model is still writing the arguments, keep the newest lines in
+/// view; once the call is complete, show the beginning like a finished diff.
+fn tool_body_streaming(name: &str, args: &Value) -> Vec<ToolBodyLine> {
+    tool_body_lines(name, args, true)
+}
+
+fn tool_body_lines(name: &str, args: &Value, streaming: bool) -> Vec<ToolBodyLine> {
     let mut body = Vec::new();
     match name {
         "write" => {
@@ -4854,6 +5277,7 @@ fn tool_body(name: &str, args: &Value) -> Vec<ToolBodyLine> {
                     body.push(ToolBodyLine {
                         kind: ToolBodyKind::Meta,
                         text: format!("edit {}", index + 1),
+                        spans: None,
                     });
                 }
                 if let Some(old) = edit.get("oldText").and_then(Value::as_str) {
@@ -4869,11 +5293,24 @@ fn tool_body(name: &str, args: &Value) -> Vec<ToolBodyLine> {
 
     if body.len() > MAX_TOOL_BODY_LINES {
         let remaining = body.len() - MAX_TOOL_BODY_LINES;
-        body.truncate(MAX_TOOL_BODY_LINES);
-        body.push(ToolBodyLine {
-            kind: ToolBodyKind::Meta,
-            text: format!("... {remaining} more lines"),
-        });
+        if streaming {
+            body.drain(..remaining);
+            body.insert(
+                0,
+                ToolBodyLine {
+                    kind: ToolBodyKind::Meta,
+                    text: format!("... {remaining} earlier lines"),
+                    spans: None,
+                },
+            );
+        } else {
+            body.truncate(MAX_TOOL_BODY_LINES);
+            body.push(ToolBodyLine {
+                kind: ToolBodyKind::Meta,
+                text: format!("... {remaining} more lines"),
+                spans: None,
+            });
+        }
     }
     body
 }
@@ -4888,6 +5325,7 @@ fn push_body_text(body: &mut Vec<ToolBodyLine>, text: &str, kind: ToolBodyKind) 
         body.push(ToolBodyLine {
             kind,
             text: format!("{prefix} {line}"),
+            spans: None,
         });
     }
 }
@@ -5554,6 +5992,127 @@ mod tests {
     }
 
     #[test]
+    fn stopped_tool_call_stream_is_marked_failed() {
+        let mut app = test_app();
+        app.on_pi_record(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_start",
+                "contentIndex": 0,
+                "id": "call-1",
+                "toolName": "write"
+            }
+        }));
+        app.on_pi_record(json!({ "type": "agent_settled" }));
+        assert!(matches!(
+            app.agent.entries.last(),
+            Some(Entry::Tool(tool)) if matches!(tool.state, ToolState::Failed)
+        ));
+    }
+
+    #[test]
+    fn streaming_tool_body_keeps_the_newest_lines() {
+        let content: String = (0..120).map(|line| format!("line {line}\n")).collect();
+        let args = json!({ "path": "big.txt", "content": content });
+        let body = tool_body_streaming("write", &args);
+        assert_eq!(body.len(), MAX_TOOL_BODY_LINES + 1);
+        assert_eq!(body[0].text, "... 40 earlier lines");
+        assert_eq!(body.last().expect("last line").text, "  line 119");
+        assert_eq!(
+            tool_body("write", &args)
+                .last()
+                .expect("last line")
+                .text,
+            "... 40 more lines"
+        );
+    }
+
+    #[test]
+    fn partial_json_keeps_unfinished_arguments() {
+        let value = partial_json(r#"{"path":"src/main.rs","content":"line one\nline "#)
+            .expect("partial value");
+        assert_eq!(value.get("path").and_then(Value::as_str), Some("src/main.rs"));
+        assert_eq!(value.get("content").and_then(Value::as_str), Some("line one\nline "));
+
+        let value = partial_json(r#"{"edits":[{"oldText":"a"},{"newText":"b"}],"n":3}"#)
+            .expect("value");
+        assert_eq!(value.pointer("/edits/1/newText").and_then(Value::as_str), Some("b"));
+        assert_eq!(value.get("n").and_then(Value::as_u64), Some(3));
+    }
+
+    #[test]
+    fn tool_call_streams_into_a_live_entry() {
+        let mut app = test_app();
+        app.on_pi_record(json!({
+            "type": "message_start",
+            "message": { "role": "assistant" }
+        }));
+        app.on_pi_record(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_start",
+                "contentIndex": 0,
+                "id": "call-1",
+                "toolName": "write"
+            }
+        }));
+        // The label starts bare, then fills in as the path arrives.
+        assert!(matches!(
+            app.agent.entries.last(),
+            Some(Entry::Tool(tool)) if tool.label == "write" && tool.body.is_empty()
+        ));
+        for delta in [
+            r#"{"path":"notes.txt","#,
+            r#""content":"first line\n"#,
+            r#"second line"#,
+        ] {
+            app.on_pi_record(json!({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "toolcall_delta",
+                    "contentIndex": 0,
+                    "delta": delta
+                }
+            }));
+        }
+        match app.agent.entries.last() {
+            Some(Entry::Tool(tool)) => {
+                assert_eq!(tool.label, "write notes.txt");
+                assert!(matches!(tool.state, ToolState::Running));
+                let body: Vec<&str> = tool.body.iter().map(|line| line.text.as_str()).collect();
+                assert_eq!(body, ["  first line", "  second line"]);
+            }
+            _ => panic!("tool entry missing"),
+        }
+
+        app.on_pi_record(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_end",
+                "contentIndex": 0,
+                "toolCall": {
+                    "id": "call-1",
+                    "name": "write",
+                    "arguments": { "path": "notes.txt", "content": "first line\nsecond line" }
+                }
+            }
+        }));
+        app.on_pi_record(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "call-1",
+            "toolName": "write",
+            "args": { "path": "notes.txt", "content": "first line\nsecond line" }
+        }));
+        let tools = app
+            .agent
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Tool(_)))
+            .count();
+        assert_eq!(tools, 1, "execution start must reuse the streamed entry");
+    }
+
+    #[test]
     fn tracks_read_ranges() {
         let mut app = test_app();
         app.on_pi_record(json!({
@@ -5585,6 +6144,58 @@ mod tests {
                 .expect("read track")
                 .active
         );
+    }
+
+    #[test]
+    fn write_tool_body_is_syntax_highlighted() {
+        let mut app = test_app();
+        app.on_pi_record(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "call-1",
+            "toolName": "write",
+            "args": {
+                "path": "src/new_file.rs",
+                "content": "fn main() {\n    let value = 1;\n}\n"
+            }
+        }));
+        let Some(Entry::Tool(tool)) = app.agent.entries.last() else {
+            panic!("tool entry missing");
+        };
+        assert_eq!(tool.body[0].text, "  fn main() {");
+        let spans = tool.body[0].spans.as_ref().expect("highlighted spans");
+        assert_eq!(spans[0].1, "  ", "the diff prefix stays its own span");
+        assert!(spans.len() > 2, "keywords and punctuation get their own spans");
+        assert!(spans.iter().skip(1).any(|(style, _)| {
+            style.fg != Some(crate::theme::FG)
+        }));
+    }
+
+    #[test]
+    fn todo_edits_stay_out_of_the_editor() {
+        let root = temp_root("smol-todo-editor");
+        let mut app = App::new(root.clone(), true);
+        app.on_pi_record(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "call-1",
+            "toolName": "write",
+            "args": { "path": ".smol/todo.md", "content": "[x] done\n" }
+        }));
+        app.on_pi_record(json!({
+            "type": "tool_execution_end",
+            "toolCallId": "call-1",
+            "toolName": "write",
+            "isError": false
+        }));
+
+        assert!(app.tracks.is_empty(), "todo edits must not be highlighted");
+        assert!(app.editor.buffer().is_none(), "the editor must not follow it");
+        assert!(app.pending.is_empty());
+        assert!(app
+            .agent
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::Tool(_))));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
