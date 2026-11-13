@@ -5,7 +5,10 @@ mod highlight;
 mod markdown;
 mod pi;
 mod predict;
+mod prompt;
+mod scripts;
 mod theme;
+mod todo;
 mod tree;
 mod ui;
 
@@ -235,8 +238,8 @@ Agent commands:
   /new            Start a new session
   /history        Resume or delete a saved session
   /compact        Compact context
-  /model          List or switch models
-  /thinking       Show or set the thinking level
+  /model          Open the model list
+  /thinking       Open the thinking level list, or set a level
   /abort          Stop the running prompt
   /stats          Show session usage
   /copy           Copy the last assistant message

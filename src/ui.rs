@@ -13,6 +13,7 @@ use crate::app::{
 };
 use crate::editor::{display_width, Buffer};
 use crate::theme;
+use crate::todo::{format_duration, TodoStatus, TodoTask};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -85,6 +86,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_menu(frame, main, app);
     draw_context_menu(frame, main, app);
     draw_session_history(frame, main, app);
+    draw_picker(frame, main, app);
     draw_file_dialog(frame, main, app);
     draw_status(frame, status, app);
 }
@@ -836,6 +838,128 @@ fn working_label(elapsed_ms: u128) -> &'static str {
     FRAMES[(elapsed_ms / 280) as usize % FRAMES.len()]
 }
 
+/// Most task rows the todo panel may show; the rest are implied by the
+/// `done/total` heading.
+const TODO_MAX_ROWS: usize = 8;
+
+/// Rows the todo panel takes from the agent pane: one heading plus tasks,
+/// never leaving fewer than three rows for the transcript.
+fn todo_panel_height(app: &App, free: u16) -> u16 {
+    if app.todo.is_empty() {
+        return 0;
+    }
+    let budget = free.saturating_sub(3);
+    if budget < 3 {
+        return 0;
+    }
+    let rows = 1 + app.todo.tasks.len().min(TODO_MAX_ROWS) as u16;
+    rows.min(budget)
+}
+
+fn draw_todo_panel(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let tasks = &app.todo.tasks;
+    let done = app.todo.done();
+    let total = tasks.len();
+
+    let heading = format!(" todos {done}/{total} ");
+    let percent = if total == 0 {
+        0
+    } else {
+        done * 100 / total
+    };
+    let mut right = String::new();
+    if width >= display_width(&heading) + 16 {
+        let inner = width
+            .saturating_sub(display_width(&heading) + 8)
+            .clamp(4, 14);
+        let filled = (done * inner + total / 2) / total.max(1);
+        right = format!(
+            "[{}{}] {}%",
+            "#".repeat(filled),
+            "-".repeat(inner - filled),
+            percent
+        );
+    }
+    let gap = width.saturating_sub(display_width(&heading) + display_width(&right));
+    let head_bg = Style::default().bg(theme::PANEL_ALT);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            heading,
+            head_bg
+                .fg(theme::FG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ".repeat(gap), head_bg),
+        Span::styled(
+            right,
+            head_bg.fg(if done == total {
+                theme::GREEN
+            } else {
+                theme::DIM
+            }),
+        ),
+    ])];
+
+    let visible = area.height.saturating_sub(1) as usize;
+    let mut rows: Vec<(usize, &TodoTask)> = tasks.iter().enumerate().take(visible).collect();
+    if let Some(active) = app.todo.active_index() {
+        // The running task is the one worth seeing when the list overflows.
+        if active >= visible && visible > 0 {
+            rows.pop();
+            rows.push((active, &tasks[active]));
+        }
+    }
+
+    for (_index, task) in rows {
+        let (marker, color) = match task.status {
+            TodoStatus::Pending => ("[ ]", theme::FAINT),
+            TodoStatus::Active => ("[>]", theme::ACCENT),
+            TodoStatus::Done => ("[x]", theme::GREEN),
+        };
+        let time = app
+            .todo
+            .elapsed(&task.title, app.now)
+            .map(format_duration)
+            .unwrap_or_default();
+        let time_width = display_width(&time);
+        let title_width = width.saturating_sub(4 + time_width + 1);
+        let title = clip_display(&task.title, title_width);
+        let title_width = display_width(&title);
+        let gap = width.saturating_sub(4 + title_width + time_width);
+
+        let mut title_style = Style::default().fg(if task.status == TodoStatus::Active {
+            theme::FG
+        } else {
+            theme::DIM
+        });
+        if task.status == TodoStatus::Done {
+            title_style = title_style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker} "),
+                Style::default().fg(color),
+            ),
+            Span::styled(title, title_style),
+            Span::styled(" ".repeat(gap), title_style),
+            Span::styled(time, Style::default().fg(theme::FAINT)),
+        ]));
+    }
+
+    while lines.len() < area.height as usize {
+        lines.push(Line::from(""));
+    }
+    lines.truncate(area.height as usize);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::PANEL)),
+        area,
+    );
+}
+
 fn draw_agent(frame: &mut Frame, rect: Rect, app: &mut App) {
     let border = if matches!(app.resizing, Some(ResizeEdge::Agent)) {
         theme::ACCENT
@@ -904,11 +1028,15 @@ fn draw_agent(frame: &mut Frame, rect: Rect, app: &mut App) {
 
     let running = matches!(app.pi, PiState::Running(_));
     let input_height = if running && content.height >= 2 { 1 } else { 0 };
+    let free = content
+        .height
+        .saturating_sub(1 + input_height);
+    let todo_height = todo_panel_height(app, free);
     let body = Rect {
         x: content.x,
         y: content.y + 1,
         width: content.width,
-        height: content.height.saturating_sub(1 + input_height),
+        height: free.saturating_sub(todo_height),
     };
 
     app.ui.agent_thinking.clear();
@@ -916,6 +1044,16 @@ fn draw_agent(frame: &mut Frame, rect: Rect, app: &mut App) {
         PiState::Missing if app.agent.entries.is_empty() => draw_missing(frame, body),
         PiState::Failed(error) if app.agent.entries.is_empty() => draw_failed(frame, body, error),
         _ => draw_conversation(frame, body, app),
+    }
+
+    if todo_height > 0 {
+        let panel = Rect {
+            x: content.x,
+            y: content.y + content.height - input_height - todo_height,
+            width: content.width,
+            height: todo_height,
+        };
+        draw_todo_panel(frame, panel, app);
     }
 
     if input_height == 1 {
@@ -1750,6 +1888,151 @@ fn draw_session_history(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+fn draw_picker(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.ui.picker = Rect::default();
+    app.ui.picker_rows.clear();
+    let Some(picker) = &app.picker else {
+        return;
+    };
+    let width = area.width.saturating_sub(8).clamp(52, 84).min(area.width);
+    let desired = (picker.items.len() as u16).saturating_add(3);
+    let height = desired.clamp(7, 24).min(area.height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+
+    let title = format!(" {} ", picker.title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(clip_display(&title, width.saturating_sub(4) as usize))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    app.ui.picker = inner;
+
+    let width = inner.width as usize;
+    let list_height = inner.height.saturating_sub(1) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if picker.items.is_empty() {
+        let (first, second) = if matches!(app.pi, PiState::Running(_)) {
+            ("loading models", "one moment")
+        } else {
+            ("no models available", "check pi's model config")
+        };
+        lines.push(Line::from(Span::styled(
+            first,
+            Style::default().fg(theme::FAINT),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            second,
+            Style::default().fg(theme::FAINT),
+        )));
+    } else {
+        let offset = picker
+            .selected
+            .saturating_sub(list_height.saturating_sub(1));
+        for (index, item) in picker
+            .items
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(list_height)
+        {
+            let selected = index == picker.selected;
+            let active = item.active;
+            let bg = if selected {
+                theme::SELECT
+            } else {
+                theme::PANEL
+            };
+            let prefix = format!(
+                " {}{} ",
+                if selected { '>' } else { ' ' },
+                if active { '*' } else { ' ' }
+            );
+            let hint = item.hint.clone();
+            let hint_width = display_width(&hint);
+            let label = clip_display(
+                &item.label,
+                width.saturating_sub(display_width(&prefix) + hint_width + 3),
+            );
+            let label_width = display_width(&label);
+            let used = display_width(&prefix) + label_width + hint_width + 1;
+            let gap = width.saturating_sub(used);
+
+            let label_style = Style::default()
+                .fg(if selected { theme::FG } else { theme::DIM })
+                .bg(bg);
+            let hint_style = Style::default()
+                .fg(if selected { theme::FG } else { theme::FAINT })
+                .bg(bg);
+            let mut spans = vec![Span::styled(format!("{prefix}{label}"), label_style)];
+            spans.push(Span::styled(" ".repeat(gap), label_style));
+            spans.push(Span::styled(hint, hint_style));
+            let row_y = inner.y + (lines.len() as u16);
+            lines.push(Line::from(spans));
+            if row_y < inner.y + inner.height {
+                app.ui.picker_rows.push((
+                    Rect {
+                        x: inner.x,
+                        y: row_y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                    index,
+                ));
+            }
+        }
+    }
+
+    while lines.len() < list_height {
+        lines.push(Line::from(""));
+    }
+    lines.truncate(list_height);
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::PANEL)),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: list_height as u16,
+        },
+    );
+
+    let footer = if picker.items.is_empty() {
+        "esc close".to_string()
+    } else {
+        picker.footer.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            clip_display(&footer, width),
+            Style::default().fg(theme::FAINT),
+        )))
+        .style(Style::default().bg(theme::PANEL)),
+        Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        },
+    );
+}
+
 fn draw_file_dialog(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(dialog) = &app.dialog else {
         return;
@@ -1758,6 +2041,7 @@ fn draw_file_dialog(frame: &mut Frame, area: Rect, app: &mut App) {
     let height = match dialog {
         FileDialog::Delete { .. } => 8,
         FileDialog::Rename { .. } | FileDialog::Create { .. } => 7,
+        FileDialog::Provider { fields, .. } => fields.len() as u16 + 4,
     }
     .min(area.height);
     if width == 0 || height == 0 {
@@ -1776,6 +2060,7 @@ fn draw_file_dialog(frame: &mut Frame, area: Rect, app: &mut App) {
         FileDialog::Rename { prompt, .. } | FileDialog::Create { prompt, .. } => {
             (format!(" {} ", prompt.title), theme::ACCENT)
         }
+        FileDialog::Provider { .. } => (" connect provider ".to_string(), theme::ACCENT),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1852,6 +2137,50 @@ fn draw_file_dialog(frame: &mut Frame, area: Rect, app: &mut App) {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 "enter delete  esc cancel",
+                Style::default().fg(theme::FAINT),
+            )));
+        }
+        FileDialog::Provider { fields, selected } => {
+            let label_col = 17usize.min(width.saturating_sub(4));
+            let pad = label_col.saturating_sub(2);
+            for (index, field) in fields.iter().enumerate() {
+                let active = index == *selected;
+                let bg = if active {
+                    theme::SELECT
+                } else {
+                    theme::PANEL
+                };
+                let label = clip_display(&field.title, pad);
+                let value_width = width.saturating_sub(label_col);
+                let shown = clip_display(&field.value, value_width);
+                let gap = width.saturating_sub(label_col + display_width(&shown));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {label:<pad$} "),
+                        Style::default()
+                            .fg(if active { theme::FG } else { theme::FAINT })
+                            .bg(bg),
+                    ),
+                    Span::styled(
+                        shown,
+                        Style::default()
+                            .fg(if active { theme::FG } else { theme::DIM })
+                            .bg(bg),
+                    ),
+                    Span::styled(" ".repeat(gap), Style::default().bg(bg)),
+                ]));
+                if active {
+                    let before: String = field.value.chars().take(field.cursor).collect();
+                    let x = inner.x
+                        + (label_col as u16)
+                        + (display_width(&before) as u16)
+                            .min(inner.width.saturating_sub(label_col as u16 + 1));
+                    cursor = Some(Position::new(x, inner.y + lines.len() as u16 - 1));
+                }
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "enter save  esc cancel  up/down field",
                 Style::default().fg(theme::FAINT),
             )));
         }
@@ -2747,6 +3076,182 @@ mod tests {
         let text = screen(&mut app);
         assert!(text.contains("rename README.md"));
         assert!(text.contains("enter confirm"));
+    }
+
+    /// Dumps the overlays as text for eyeballing layout; run with
+    /// `cargo test dump_screens -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_screens() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let mut app = App::new(root.clone(), true);
+        app.models = vec![
+            serde_json::json!({ "provider": "home-server", "id": "qwen35-4b", "name": "Qwen 3.5 4B Local", "contextWindow": 262000 }),
+            serde_json::json!({ "provider": "vercel-ai-gateway", "id": "zai/glm-5.3", "name": "GLM 5.3" }),
+            serde_json::json!({ "provider": "lfm", "id": "lfm3", "name": "LFM3 1.7B" }),
+        ];
+        app.model_current = Some(crate::app::ModelPref {
+            provider: "home-server".to_string(),
+            id: "qwen35-4b".to_string(),
+            name: "Qwen 3.5 4B Local".to_string(),
+            context_window: Some(262_000),
+        });
+        app.open_model_picker();
+        println!("--- model picker\n{}", screen(&mut app));
+
+        app.picker = None;
+        app.thinking_level = Some("medium".to_string());
+        app.open_thinking_picker();
+        println!("--- thinking picker\n{}", screen(&mut app));
+
+        app.picker = None;
+        app.open_provider_form(crate::app::ProviderPrefill {
+            id: "home-server".to_string(),
+            name: "Home server".to_string(),
+            base_url: "http://100.67.79.86:8080/v1".to_string(),
+            api_key: "local".to_string(),
+            api: "openai-completions".to_string(),
+            model_id: "qwen35-4b".to_string(),
+            model_name: "Qwen 3.5 4B Local".to_string(),
+            context: "262000".to_string(),
+        });
+        println!("--- provider dialog\n{}", screen(&mut app));
+
+        let mut app = App::new(root, true);
+        app.agent.entries.push(crate::app::Entry::User(
+            "add a todo panel please".to_string(),
+        ));
+        let start = std::time::Instant::now();
+        let tasks = |statuses: [crate::todo::TodoStatus; 4]| {
+            [
+                "explore the repo",
+                "write the parser with tests",
+                "render the panel",
+                "update the docs",
+            ]
+            .iter()
+            .zip(statuses)
+            .map(|(title, status)| crate::todo::TodoTask {
+                title: (*title).to_string(),
+                status,
+            })
+            .collect::<Vec<_>>()
+        };
+        use crate::todo::TodoStatus::{Active, Done, Pending};
+        app.todo.apply_read(tasks([Pending, Active, Pending, Pending]), start);
+        app.todo.apply_read(
+            tasks([Done, Active, Pending, Pending]),
+            start + std::time::Duration::from_secs(42),
+        );
+        app.now = start + std::time::Duration::from_secs(300);
+        println!("--- todo panel\n{}", screen(&mut app));
+    }
+
+    #[test]
+    fn provider_dialog_renders_the_form() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root, true);
+        app.open_provider_form(crate::app::ProviderPrefill {
+            id: "home".to_string(),
+            name: "Home server".to_string(),
+            base_url: "http://100.67.79.86:8080/v1".to_string(),
+            api_key: "local".to_string(),
+            api: "openai-completions".to_string(),
+            model_id: "qwen35-4b".to_string(),
+            model_name: "Qwen 3.5 4B Local".to_string(),
+            context: "262000".to_string(),
+        });
+
+        let text = screen(&mut app);
+        assert!(text.contains("connect provider"), "{text}");
+        for label in crate::app::PROVIDER_LABELS {
+            assert!(text.contains(label), "missing {label}: {text}");
+        }
+        assert!(text.contains("home"), "{text}");
+        assert!(text.contains("http://100.67.79.86:8080/v1"), "{text}");
+        assert!(text.contains("262000"), "{text}");
+        assert!(text.contains("enter save"), "{text}");
+    }
+
+    #[test]
+    fn picker_overlay_renders_models() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root, true);
+        app.models = vec![
+            serde_json::json!({ "provider": "zai", "id": "glm-4.6", "name": "GLM 4.6" }),
+            serde_json::json!({
+                "provider": "anthropic",
+                "id": "claude-sonnet-4",
+                "name": "Claude Sonnet 4",
+                "contextWindow": 200000
+            }),
+        ];
+        app.model_current = Some(crate::app::ModelPref {
+            provider: "anthropic".to_string(),
+            id: "claude-sonnet-4".to_string(),
+            name: "Claude Sonnet 4".to_string(),
+            context_window: Some(200_000),
+        });
+        app.open_model_picker();
+
+        let text = screen(&mut app);
+        assert!(text.contains("model · 2"));
+        assert!(text.contains("GLM 4.6"));
+        assert!(text.contains("Claude Sonnet 4"));
+        assert!(text.contains("200k"));
+        assert!(text.contains("enter switch"));
+        // The active model is starred and the list is clickable.
+        assert!(text.contains("* Claude Sonnet 4") || text.contains(" *Claude"));
+        assert_eq!(app.ui.picker_rows.len(), 2);
+        assert!(app.ui.picker.width > 0);
+    }
+
+    #[test]
+    fn todo_panel_shows_progress_and_durations() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root, true);
+        let start = std::time::Instant::now();
+        let pending = |title: &str| crate::todo::TodoTask {
+            title: title.to_string(),
+            status: crate::todo::TodoStatus::Pending,
+        };
+        let mut active = pending("write the parser");
+        active.status = crate::todo::TodoStatus::Active;
+
+        app.todo.apply_read(
+            vec![pending("explore the repo"), active.clone(), pending("ship it")],
+            start,
+        );
+        app.todo.apply_read(
+            vec![
+                crate::todo::TodoTask {
+                    title: "explore the repo".to_string(),
+                    status: crate::todo::TodoStatus::Done,
+                },
+                active,
+                pending("ship it"),
+            ],
+            start + std::time::Duration::from_secs(30),
+        );
+        app.now = start + std::time::Duration::from_secs(75);
+
+        let text = screen(&mut app);
+        assert!(text.contains("todos 1/3"), "heading missing: {text}");
+        assert!(text.contains("33%"), "progress missing: {text}");
+        assert!(text.contains("[x] explore the repo"), "{text}");
+        assert!(text.contains("30s"), "finished duration missing: {text}");
+        assert!(text.contains("[>] write the parser"), "{text}");
+        assert!(text.contains("1m15s"), "live duration missing: {text}");
+        assert!(text.contains("[ ] ship it"), "{text}");
+    }
+
+    #[test]
+    fn todo_panel_stays_hidden_without_tasks() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut app = App::new(root, true);
+        let text = screen(&mut app);
+        assert!(!text.contains("todos "), "no panel expected: {text}");
     }
 
     #[test]

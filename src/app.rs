@@ -17,9 +17,14 @@ use serde_json::{json, Value};
 use crate::editor::Editor;
 use crate::git::Git;
 use crate::pi::{find_pi, PiClient, PiEvent};
+use crate::todo;
 use crate::tree::FileTree;
 
 const AUTO_COMPACT_PERCENT: u64 = 95;
+
+/// Every level pi accepts; the picker narrows this to what the model supports
+/// once `get_available_thinking_levels` answers.
+const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
@@ -101,6 +106,8 @@ pub struct UiRects {
     pub context_menu: Rect,
     pub history: Rect,
     pub history_rows: Vec<(Rect, usize)>,
+    pub picker: Rect,
+    pub picker_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -179,6 +186,9 @@ pub enum MenuAction {
     AddTests,
     FormatFile,
     SessionHistory,
+    ModelPicker,
+    Thinking,
+    Provider,
     Quit,
 }
 
@@ -309,6 +319,75 @@ pub enum FileDialog {
         is_dir: bool,
         dirty: bool,
     },
+    /// Add or edit a provider in pi's `models.json`.
+    Provider {
+        fields: Vec<TextPrompt>,
+        selected: usize,
+    },
+}
+
+/// Row order of the [`FileDialog::Provider`] form.
+pub const PROVIDER_LABELS: [&str; 8] = [
+    "provider id",
+    "display name",
+    "base url",
+    "api key",
+    "api",
+    "model id",
+    "model name",
+    "context window",
+];
+
+/// An existing provider, opened in the form so it can be edited.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct ProviderPrefill {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub api: String,
+    pub model_id: String,
+    pub model_name: String,
+    pub context: String,
+}
+
+impl ProviderPrefill {
+    fn from_entry(id: &str, entry: &Value) -> Self {
+        let model = entry
+            .get("models")
+            .and_then(Value::as_array)
+            .and_then(|models| models.first())
+            .unwrap_or(&Value::Null);
+        let text = |key: &str| {
+            entry
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        Self {
+            id: id.to_string(),
+            name: text("name"),
+            base_url: text("baseUrl"),
+            api_key: text("apiKey"),
+            api: text("api"),
+            model_id: model
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            model_name: model
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            context: model
+                .get("contextWindow")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 fn submenu_item(label: &str, count: usize, kind: MenuPageKind) -> MenuItem {
@@ -366,6 +445,89 @@ pub struct SessionHistory {
     pub sessions: Vec<SessionInfo>,
     pub selected: usize,
     pub confirm: Option<PathBuf>,
+}
+
+/// A model as pi reports it: provider plus id identify a model, name is what
+/// the user sees, and the context window is only used for the picker label.
+#[derive(Clone, Debug, Eq)]
+pub struct ModelPref {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+    pub context_window: Option<u64>,
+}
+
+impl PartialEq for ModelPref {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider == other.provider && self.id == other.id
+    }
+}
+
+impl ModelPref {
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let provider = value.get("provider").and_then(Value::as_str)?.to_string();
+        let id = value
+            .get("id")
+            .or_else(|| value.get("modelId"))
+            .and_then(Value::as_str)?
+            .to_string();
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| id.clone());
+        let context_window = value.get("contextWindow").and_then(Value::as_u64);
+        Some(Self {
+            provider,
+            id,
+            name,
+            context_window,
+        })
+    }
+
+    pub fn label(&self) -> String {
+        self.name.clone()
+    }
+
+    pub fn hint(&self) -> String {
+        match self.context_window {
+            Some(context) if context >= 1_000 => {
+                format!("{} · {}k", self.provider, context / 1_000)
+            }
+            _ => self.provider.clone(),
+        }
+    }
+}
+
+pub struct PickerItem {
+    pub label: String,
+    pub hint: String,
+    pub active: bool,
+}
+
+/// What Enter does with the highlighted row.
+pub enum PickerAction {
+    SetModel(Vec<ModelPref>),
+    SetThinking(Vec<String>),
+    EditProvider(Vec<ProviderPrefill>),
+}
+
+enum Choice {
+    Model(ModelPref),
+    Thinking(String),
+    Provider(ProviderPrefill),
+}
+
+pub struct ListPicker {
+    pub title: String,
+    pub footer: String,
+    pub items: Vec<PickerItem>,
+    pub selected: usize,
+    /// Set once the user moves the selection, so a late data refresh does not
+    /// yank the cursor back to the active row.
+    pub touched: bool,
+    pub action: PickerAction,
 }
 
 pub struct Agent {
@@ -704,6 +866,10 @@ pub struct App {
     pub agent: Agent,
     pub git: Git,
     pub pi: PiState,
+    /// The pi binary to spawn, or `None` when pi is unavailable.
+    pi_path: Option<PathBuf>,
+    /// File passed to `--append-system-prompt`, written by smol at startup.
+    instructions: Option<PathBuf>,
     pub focus: Focus,
     pub sidebar: Sidebar,
     pub should_quit: bool,
@@ -714,6 +880,23 @@ pub struct App {
     pub started_at: Instant,
     last_tree_refresh: Instant,
     pub model: Option<String>,
+    /// The model pi reports as active right now.
+    pub model_current: Option<ModelPref>,
+    /// Last model the user picked, remembered across launches.
+    model_pref: Option<ModelPref>,
+    model_pref_file: Option<PathBuf>,
+    /// True while an automatic `set_model` (startup or new session) is in flight.
+    model_auto_apply: bool,
+    /// Persist the model reported by the next `get_state` (after a session switch).
+    model_record_once: bool,
+    pub picker: Option<ListPicker>,
+    /// The thinking level pi reports, and the levels the model supports.
+    pub thinking_level: Option<String>,
+    pub thinking_levels: Vec<String>,
+    /// `.smol/todo.md` list the model maintains, with per-task timing.
+    pub todo: todo::TodoList,
+    /// pi's `models.json`, where connections are saved.
+    pub models_file: PathBuf,
     pub diff: Option<DiffView>,
     pub menu: Option<CommandMenu>,
     pub context_menu: Option<ContextMenu>,
@@ -762,30 +945,21 @@ impl App {
             });
             Some(rx)
         };
+        let model_pref_file = config_file("model.json");
+        let model_pref = model_pref_file.as_deref().and_then(load_model_pref);
+        let instructions = crate::prompt::write_instructions();
         let pi_path = if force_no_pi { None } else { find_pi() };
-        let pi = match pi_path.clone() {
-            Some(path) => match PiClient::spawn(&path, &root) {
-                Ok(mut client) => {
-                    let _ = client.get_state();
-                    let _ = client.send(json!({ "type": "get_commands" }));
-                    let _ = client.send(json!({ "type": "get_available_models" }));
-                    let _ = client.send(json!({ "type": "set_auto_compaction", "enabled": false }));
-                    let _ = client.send(json!({ "type": "get_session_stats" }));
-                    PiState::Running(client)
-                }
-                Err(error) => PiState::Failed(format!("could not start pi: {error}")),
-            },
-            None => PiState::Missing,
-        };
 
-        Self {
+        let mut app = Self {
             root,
             tree,
             project_files,
             editor,
             agent: Agent::new(),
             git,
-            pi,
+            pi: PiState::Missing,
+            pi_path,
+            instructions,
             focus: Focus::Tree,
             sidebar: Sidebar::Files,
             should_quit: false,
@@ -796,6 +970,16 @@ impl App {
             started_at: Instant::now(),
             last_tree_refresh: Instant::now(),
             model: None,
+            model_current: None,
+            model_pref,
+            model_pref_file,
+            model_auto_apply: false,
+            model_record_once: false,
+            picker: None,
+            thinking_level: None,
+            thinking_levels: Vec::new(),
+            todo: todo::TodoList::new(),
+            models_file: models_file(),
             diff: None,
             menu: None,
             context_menu: None,
@@ -825,7 +1009,61 @@ impl App {
             pi_stderr: Vec::new(),
             pi_exited: false,
             project_lines,
+        };
+        app.start_pi(None);
+        app
+    }
+
+    /// Spawns pi with smol's flags: full permissions (`-a`), no extensions
+    /// (`-ne`), no skills (`-ns`), the appended system prompt, and optionally
+    /// a session to resume. Restarting this way keeps the conversation.
+    fn start_pi(&mut self, resume: Option<PathBuf>) {
+        if let PiState::Running(client) = &mut self.pi {
+            client.shutdown();
         }
+        let Some(path) = self.pi_path.clone() else {
+            self.pi = PiState::Missing;
+            return;
+        };
+        let mut args: Vec<String> = vec![
+            "-a".to_string(),
+            "-ne".to_string(),
+            "-ns".to_string(),
+        ];
+        if let Some(instructions) = &self.instructions {
+            args.push("--append-system-prompt".to_string());
+            args.push(instructions.to_string_lossy().to_string());
+        }
+        if let Some(session) = resume {
+            args.push("--session".to_string());
+            args.push(session.to_string_lossy().to_string());
+        }
+        let spawned = PiClient::spawn_with(&path, &self.root, &args);
+        self.pi = match spawned {
+            Ok(client) => PiState::Running(client),
+            Err(error) => PiState::Failed(format!("could not start pi: {error}")),
+        };
+        self.init_pi();
+    }
+
+    /// The handshake every fresh pi process needs, including re-applying the
+    /// remembered model.
+    fn init_pi(&mut self) {
+        if !matches!(self.pi, PiState::Running(_)) {
+            return;
+        }
+        self.send_rpc(json!({ "type": "get_state" }));
+        self.send_rpc(json!({ "type": "get_commands" }));
+        self.send_rpc(json!({ "type": "get_available_models" }));
+        self.send_rpc(json!({ "type": "set_auto_compaction", "enabled": false }));
+        self.send_rpc(json!({ "type": "get_session_stats" }));
+        self.apply_model_pref();
+    }
+
+    /// Restarts pi, resuming the open session so the transcript survives.
+    pub fn restart_pi(&mut self) {
+        let resume = self.session_path.clone();
+        self.start_pi(resume);
     }
 
     pub fn shutdown(&mut self) {
@@ -951,6 +1189,7 @@ impl App {
             "agent_settled" => {
                 self.agent.busy = false;
                 self.agent.scroll = 0;
+                self.refresh_todo();
                 self.request_context_stats(false);
             }
             "auto_retry_start" => {
@@ -992,6 +1231,14 @@ impl App {
             .unwrap_or(false);
 
         if !success {
+            if command == "set_model" && std::mem::take(&mut self.model_auto_apply) {
+                // The remembered model is gone from pi's config: drop it so smol
+                // stops asking for it on every launch.
+                self.forget_model_pref();
+                self.agent
+                    .note("saved model is unavailable, using pi's default");
+                return;
+            }
             let error = value
                 .get("error")
                 .and_then(Value::as_str)
@@ -1016,6 +1263,12 @@ impl App {
                         .or_else(|| model.get("id"))
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    self.model_current = ModelPref::from_value(model);
+                    if std::mem::take(&mut self.model_record_once) {
+                        if let Some(pref) = self.model_current.clone() {
+                            self.remember_model_pref(pref);
+                        }
+                    }
                 }
                 if let Some(streaming) = value.pointer("/data/isStreaming").and_then(Value::as_bool)
                 {
@@ -1023,6 +1276,9 @@ impl App {
                 }
                 if let Some(path) = value.pointer("/data/sessionFile").and_then(Value::as_str) {
                     self.remember_session(path);
+                }
+                if let Some(level) = value.pointer("/data/thinkingLevel").and_then(Value::as_str) {
+                    self.thinking_level = Some(level.to_string());
                 }
             }
             "get_commands" => {
@@ -1048,15 +1304,33 @@ impl App {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                self.refresh_picker();
+            }
+            "get_available_thinking_levels" => {
+                self.thinking_levels = value
+                    .pointer("/data/levels")
+                    .and_then(Value::as_array)
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.refresh_picker();
             }
             "set_model" => {
-                let name = value
-                    .pointer("/data/name")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.pointer("/data/id").and_then(Value::as_str));
-                if let Some(name) = name {
-                    self.model = Some(name.to_string());
-                    self.set_status(format!("model {name}"));
+                self.model_auto_apply = false;
+                let data = value.get("data");
+                let pref = data.and_then(|data| {
+                    ModelPref::from_value(data)
+                        .or_else(|| data.pointer("/model").and_then(ModelPref::from_value))
+                });
+                if let Some(pref) = pref {
+                    self.model = Some(pref.label());
+                    self.remember_model_pref(pref.clone());
+                    self.set_status(format!("model {}", pref.label()));
                 } else {
                     self.set_status("model changed");
                 }
@@ -1071,6 +1345,7 @@ impl App {
                 self.auto_compacted = false;
                 self.set_status("new session");
                 self.send_rpc(json!({ "type": "get_state" }));
+                self.apply_model_pref();
             }
             "switch_session" => {
                 let cancelled = value
@@ -1085,6 +1360,9 @@ impl App {
                     self.agent.reset();
                     self.context_percent = None;
                     self.auto_compacted = false;
+                    // The resumed session brings its own model; remember it as
+                    // the last used one instead of overriding it.
+                    self.model_record_once = true;
                     self.set_status("loading session");
                     self.send_rpc(json!({ "type": "get_messages" }));
                     self.send_rpc(json!({ "type": "get_state" }));
@@ -1098,8 +1376,14 @@ impl App {
             }
             "set_thinking_level" => {
                 if let Some(level) = value.pointer("/data/level").and_then(Value::as_str) {
+                    self.thinking_level = Some(level.to_string());
+                }
+                let level = self.thinking_level.clone().unwrap_or_default();
+                if !level.is_empty() {
                     self.agent.note(format!("thinking {level}"));
                 }
+                // The level is clamped to the model, so ask pi what stuck.
+                self.send_rpc(json!({ "type": "get_state" }));
             }
             "get_session_stats" => {
                 if let Some(path) = value.pointer("/data/sessionFile").and_then(Value::as_str) {
@@ -1224,6 +1508,7 @@ impl App {
                 ToolState::Done
             },
         );
+        self.refresh_todo();
 
         let Some(pending) = self.pending.remove(&id) else {
             return;
@@ -1346,6 +1631,15 @@ impl App {
     pub fn tick(&mut self) {
         self.now = Instant::now();
 
+        let todo_due = self
+            .todo
+            .last_poll
+            .map(|at| self.now.duration_since(at) >= Duration::from_millis(400))
+            .unwrap_or(true);
+        if todo_due {
+            self.refresh_todo();
+        }
+
         if self.last_tree_refresh.elapsed() >= Duration::from_secs(2) {
             self.refresh_tree();
         }
@@ -1400,6 +1694,22 @@ impl App {
             && self.git.last_refresh.elapsed() >= Duration::from_secs(2)
         {
             self.git.refresh();
+        }
+    }
+
+    /// Reads `<project>/.smol/todo.md` into the panel state. The file is the
+    /// model's; smol only parses and times it.
+    fn refresh_todo(&mut self) {
+        let path = self.root.join(".smol").join("todo.md");
+        self.todo.last_poll = Some(self.now);
+        match fs::read_to_string(&path) {
+            Ok(text) => self.todo.apply_read(todo::parse(&text), self.now),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !self.todo.is_empty() {
+                    self.todo.apply(Vec::new(), self.now);
+                }
+            }
+            Err(_) => {}
         }
     }
 
@@ -1875,9 +2185,11 @@ impl App {
 
     fn model_command(&mut self, args: &str) {
         if args.is_empty() {
-            self.send_rpc(json!({ "type": "get_available_models" }));
+            self.open_model_picker();
             return;
         }
+        // An explicit choice replaces any pending automatic apply.
+        self.model_auto_apply = false;
         if let Some((provider, id)) = args.split_once('/') {
             self.send_rpc(json!({
                 "type": "set_model",
@@ -1907,29 +2219,343 @@ impl App {
             }));
         } else {
             self.agent
-                .note("use /model provider/model, or /model to list models");
+                .note("use /model provider/model, or /model to pick from a list");
+        }
+    }
+
+    /// Opens the selectable model list and asks pi for a fresh model list to
+    /// fill it with.
+    pub fn open_model_picker(&mut self) {
+        if matches!(self.pi, PiState::Running(_)) {
+            self.send_rpc(json!({ "type": "get_available_models" }));
+        } else if self.models.is_empty() {
+            match &self.pi {
+                PiState::Failed(error) => self.set_status(error.clone()),
+                _ => self.set_status("pi is not installed"),
+            }
+            return;
+        }
+        self.close_overlays();
+        self.picker = Some(self.build_model_picker());
+    }
+
+    fn build_model_picker(&self) -> ListPicker {
+        let models = model_list(&self.models);
+        let items = models
+            .iter()
+            .map(|model| PickerItem {
+                label: model.label(),
+                hint: model.hint(),
+                active: self.model_current.as_ref() == Some(model),
+            })
+            .collect();
+        let selected = model_position(&models, self.model_current.as_ref());
+        ListPicker {
+            title: format!("model · {}", models.len()),
+            footer: "up/down select  enter switch  esc close".to_string(),
+            items,
+            selected,
+            touched: false,
+            action: PickerAction::SetModel(models),
+        }
+    }
+
+    /// Opens the thinking-level list, asking pi which levels the current
+    /// model actually supports.
+    pub fn open_thinking_picker(&mut self) {
+        if matches!(self.pi, PiState::Running(_)) {
+            self.send_rpc(json!({ "type": "get_available_thinking_levels" }));
+        }
+        self.close_overlays();
+        self.picker = Some(self.build_thinking_picker());
+    }
+
+    fn build_thinking_picker(&self) -> ListPicker {
+        let levels: Vec<String> = if self.thinking_levels.is_empty() {
+            THINKING_LEVELS
+                .iter()
+                .map(|level| level.to_string())
+                .collect()
+        } else {
+            self.thinking_levels.clone()
+        };
+        let items = levels
+            .iter()
+            .map(|level| PickerItem {
+                label: level.clone(),
+                hint: String::new(),
+                active: self.thinking_level.as_deref() == Some(level.as_str()),
+            })
+            .collect();
+        let selected = self
+            .thinking_level
+            .as_deref()
+            .and_then(|current| levels.iter().position(|level| level == current))
+            .unwrap_or(0);
+        ListPicker {
+            title: format!("thinking · {}", levels.len()),
+            footer: "up/down select  enter set  esc close".to_string(),
+            items,
+            selected,
+            touched: false,
+            action: PickerAction::SetThinking(levels),
+        }
+    }
+
+    /// Opens the list of configured providers; the first row creates a new
+    /// connection, the rest open that provider for editing.
+    pub fn open_provider_picker(&mut self) {
+        if let Err(error) = read_providers(&self.models_file) {
+            self.set_status(error);
+            return;
+        }
+        self.close_overlays();
+        self.picker = Some(self.build_provider_picker());
+    }
+
+    fn build_provider_picker(&self) -> ListPicker {
+        let mut providers = read_providers(&self.models_file).unwrap_or_default();
+        let mut items = vec![PickerItem {
+            label: "new provider".to_string(),
+            hint: "connect".to_string(),
+            active: false,
+        }];
+        let current = self.model_current.as_ref().map(|model| model.provider.clone());
+        let mut selected = 0;
+        for (index, provider) in providers.iter().enumerate() {
+            let active = current.as_deref() == Some(provider.id.as_str());
+            if active {
+                selected = index + 1;
+            }
+            items.push(PickerItem {
+                label: if provider.name.is_empty() {
+                    provider.id.clone()
+                } else {
+                    provider.name.clone()
+                },
+                hint: provider.base_url.clone(),
+                active,
+            });
+        }
+        providers.insert(
+            0,
+            ProviderPrefill {
+                api: "openai-completions".to_string(),
+                context: "131072".to_string(),
+                ..ProviderPrefill::default()
+            },
+        );
+        ListPicker {
+            title: format!("provider · {}", items.len() - 1),
+            footer: "up/down select  enter connect  esc close".to_string(),
+            items,
+            selected,
+            touched: false,
+            action: PickerAction::EditProvider(providers),
+        }
+    }
+
+    /// Opens the connect form, prefilled from the chosen provider (or blank
+    /// for a new one).
+    pub fn open_provider_form(&mut self, prefill: ProviderPrefill) {
+        let values = [
+            prefill.id,
+            prefill.name,
+            prefill.base_url,
+            prefill.api_key,
+            if prefill.api.is_empty() {
+                "openai-completions".to_string()
+            } else {
+                prefill.api
+            },
+            prefill.model_id,
+            prefill.model_name,
+            if prefill.context.is_empty() {
+                "131072".to_string()
+            } else {
+                prefill.context
+            },
+        ];
+        let fields = PROVIDER_LABELS
+            .iter()
+            .zip(values)
+            .map(|(label, value)| TextPrompt::new(*label, value))
+            .collect();
+        self.picker = None;
+        self.close_overlays();
+        self.dialog = Some(FileDialog::Provider {
+            fields,
+            selected: 0,
+        });
+    }
+
+    fn close_overlays(&mut self) {
+        self.menu = None;
+        self.context_menu = None;
+        self.dialog = None;
+        self.history = None;
+    }
+
+    /// Re-reads the picker's source data without losing the row the user is
+    /// on.
+    fn refresh_picker(&mut self) {
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        let is_model = matches!(&picker.action, PickerAction::SetModel(_));
+        let touched = picker.touched;
+        let previous = picker.items.get(picker.selected).map(|item| item.label.clone());
+        let fallback = picker.selected;
+
+        let mut fresh = if is_model {
+            self.build_model_picker()
+        } else if matches!(&picker.action, PickerAction::SetThinking(_)) {
+            self.build_thinking_picker()
+        } else {
+            self.build_provider_picker()
+        };
+        if touched {
+            let position = previous
+                .and_then(|previous| fresh.items.iter().position(|item| item.label == previous));
+            fresh.selected =
+                position.unwrap_or_else(|| fallback.min(fresh.items.len().saturating_sub(1)));
+            fresh.touched = true;
+        }
+        self.picker = Some(fresh);
+    }
+
+    fn handle_picker_key(&mut self, key: KeyEvent) {
+        let mut apply = false;
+        let mut close = false;
+        if let Some(picker) = self.picker.as_mut() {
+            let last = picker.items.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picker.selected = picker.selected.saturating_sub(1);
+                    picker.touched = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    picker.selected = (picker.selected + 1).min(last);
+                    picker.touched = true;
+                }
+                KeyCode::PageUp => {
+                    picker.selected = picker.selected.saturating_sub(8);
+                    picker.touched = true;
+                }
+                KeyCode::PageDown => {
+                    picker.selected = (picker.selected + 8).min(last);
+                    picker.touched = true;
+                }
+                KeyCode::Home => {
+                    picker.selected = 0;
+                    picker.touched = true;
+                }
+                KeyCode::End => {
+                    picker.selected = last;
+                    picker.touched = true;
+                }
+                KeyCode::Enter => apply = true,
+                _ => {}
+            }
+        }
+        if close {
+            self.picker = None;
+            return;
+        }
+        if apply {
+            self.apply_selected_picker_row();
+        }
+    }
+
+    /// Runs the highlighted row: switch model or set the thinking level. The
+    /// picker stays open when there is nothing to apply yet.
+    fn apply_selected_picker_row(&mut self) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let selected = picker.selected;
+        let choice = match &picker.action {
+            PickerAction::SetModel(models) => models.get(selected).cloned().map(Choice::Model),
+            PickerAction::SetThinking(levels) => {
+                levels.get(selected).cloned().map(Choice::Thinking)
+            }
+            PickerAction::EditProvider(providers) => {
+                providers.get(selected).cloned().map(Choice::Provider)
+            }
+        };
+        match choice {
+            Some(Choice::Model(pref)) => {
+                self.model_auto_apply = false;
+                self.send_rpc(json!({
+                    "type": "set_model",
+                    "provider": pref.provider,
+                    "modelId": pref.id
+                }));
+                self.picker = None;
+            }
+            Some(Choice::Thinking(level)) => {
+                self.thinking_level = Some(level.clone());
+                self.send_rpc(json!({ "type": "set_thinking_level", "level": level }));
+                self.picker = None;
+            }
+            Some(Choice::Provider(prefill)) => self.open_provider_form(prefill),
+            None => self.picker = Some(picker),
+        }
+    }
+
+    fn apply_model_pref(&mut self) {
+        let Some(pref) = self.model_pref.clone() else {
+            return;
+        };
+        if !matches!(self.pi, PiState::Running(_)) {
+            return;
+        }
+        self.model_auto_apply = true;
+        self.send_rpc(json!({
+            "type": "set_model",
+            "provider": pref.provider,
+            "modelId": pref.id
+        }));
+    }
+
+    /// Stores the model as the one to restore on the next launch.
+    fn remember_model_pref(&mut self, pref: ModelPref) {
+        self.model_current = Some(pref.clone());
+        self.model_pref = Some(pref.clone());
+        if let Some(path) = self.model_pref_file.clone() {
+            if let Err(error) = save_model_pref(&path, &pref) {
+                self.set_status(format!("could not remember model: {error}"));
+            }
+        }
+    }
+
+    fn forget_model_pref(&mut self) {
+        self.model_pref = None;
+        if let Some(path) = self.model_pref_file.clone() {
+            let _ = fs::remove_file(path);
         }
     }
 
     fn thinking_command(&mut self, args: &str) {
-        const LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
         if args.is_empty() {
-            self.agent
-                .note(format!("thinking levels  {}", LEVELS.join("  ")));
+            self.open_thinking_picker();
             return;
         }
-        if LEVELS.contains(&args) {
+        if THINKING_LEVELS.contains(&args) {
+            self.thinking_level = Some(args.to_string());
             self.send_rpc(json!({ "type": "set_thinking_level", "level": args }));
         } else {
             self.agent
-                .note("thinking levels  off minimal low medium high xhigh max");
+                .note(format!("thinking levels  {}", THINKING_LEVELS.join("  ")));
         }
     }
 
     fn command_help(&self) -> String {
         let mut text = String::from(
-            "commands\n/help  /new  /history  /compact [instructions]  /model [provider/model]  /thinking [level]\n/abort  /stats  /name [name]  /export [path]  /copy  /hide  /show\n",
+            "commands\n/help  /new  /history  /compact [instructions]  /model  /thinking [level]\n/abort  /stats  /name [name]  /export [path]  /copy  /hide  /show\n",
         );
+        text.push_str("/model and /thinking open lists to pick from\n");
         if !self.commands.is_empty() {
             text.push_str("\npi resources\n");
             for command in self.commands.iter().take(16) {
@@ -1972,6 +2598,10 @@ impl App {
         }
         if self.history.is_some() {
             self.handle_history_key(key);
+            return;
+        }
+        if self.picker.is_some() {
+            self.handle_picker_key(key);
             return;
         }
         if self.context_menu.is_some() {
@@ -2230,7 +2860,7 @@ impl App {
             selected: 0,
             items: vec![
                 submenu_item("Files", 4, MenuPageKind::Files),
-                submenu_item("Settings", 5, MenuPageKind::Settings),
+                submenu_item("Settings", 7, MenuPageKind::Settings),
                 submenu_item("LLM commands", 6, MenuPageKind::Llm),
                 submenu_item("Git", 2, MenuPageKind::Git),
                 MenuItem {
@@ -2302,6 +2932,27 @@ impl App {
                             label: "Session history".to_string(),
                             hint: "ctrl+r".to_string(),
                             action: MenuAction::SessionHistory,
+                        },
+                        MenuItem {
+                            label: "Model".to_string(),
+                            hint: self
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| "select".to_string()),
+                            action: MenuAction::ModelPicker,
+                        },
+                        MenuItem {
+                            label: "Thinking".to_string(),
+                            hint: self
+                                .thinking_level
+                                .clone()
+                                .unwrap_or_else(|| "select".to_string()),
+                            action: MenuAction::Thinking,
+                        },
+                        MenuItem {
+                            label: "Provider".to_string(),
+                            hint: "connect".to_string(),
+                            action: MenuAction::Provider,
                         },
                     ],
                 }
@@ -2450,6 +3101,9 @@ impl App {
             MenuAction::AddTests => self.add_tests_with_pi(),
             MenuAction::FormatFile => self.format_file_with_pi(),
             MenuAction::SessionHistory => self.open_history(),
+            MenuAction::ModelPicker => self.open_model_picker(),
+            MenuAction::Thinking => self.open_thinking_picker(),
+            MenuAction::Provider => self.open_provider_picker(),
             MenuAction::Quit => self.should_quit = true,
         }
         if keep_open {
@@ -2646,6 +3300,44 @@ impl App {
                     KeyCode::Enter | KeyCode::Char('y') => submit = true,
                     _ => {}
                 },
+                FileDialog::Provider { fields, selected } => {
+                    let last = fields.len().saturating_sub(1);
+                    match key.code {
+                        KeyCode::Esc => cancel = true,
+                        KeyCode::Enter => submit = true,
+                        KeyCode::Up | KeyCode::BackTab => {
+                            *selected = selected.saturating_sub(1)
+                        }
+                        KeyCode::Down | KeyCode::Tab => {
+                            *selected = (*selected + 1).min(last)
+                        }
+                        _ => {
+                            if let Some(field) = fields.get_mut(*selected) {
+                                match key.code {
+                                    KeyCode::Backspace => field.backspace(),
+                                    KeyCode::Delete => field.delete(),
+                                    KeyCode::Left => field.left(),
+                                    KeyCode::Right => field.right(),
+                                    KeyCode::Home => field.cursor = 0,
+                                    KeyCode::End => {
+                                        field.cursor = field.value.chars().count()
+                                    }
+                                    KeyCode::Char('v') if ctrl => {
+                                        if let Some(text) = paste.as_deref() {
+                                            field.insert_text(text);
+                                        }
+                                    }
+                                    KeyCode::Char('u') if ctrl => {
+                                        field.value.clear();
+                                        field.cursor = 0;
+                                    }
+                                    KeyCode::Char(ch) if !ctrl && !alt => field.insert(ch),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
                 FileDialog::Rename { prompt, .. } | FileDialog::Create { prompt, .. } => {
                     match key.code {
                         KeyCode::Esc => cancel = true,
@@ -2785,6 +3477,25 @@ impl App {
                 self.tree.reveal(&parent);
                 self.focus = Focus::Tree;
                 self.set_status(format!("deleted {}", self.editor.rel_of(&target)));
+            }
+            FileDialog::Provider { fields, .. } => {
+                if self.agent.busy {
+                    self.set_status("stop the agent before changing providers");
+                    return;
+                }
+                match save_provider_to(&self.models_file, &fields) {
+                    Ok(message) => {
+                        self.dialog = None;
+                        let running = matches!(self.pi, PiState::Running(_));
+                        if running {
+                            self.restart_pi();
+                            self.set_status(format!("{message}, pi restarted"));
+                        } else {
+                            self.set_status(message);
+                        }
+                    }
+                    Err(error) => self.set_status(error),
+                }
             }
         }
     }
@@ -3131,6 +3842,7 @@ impl App {
                 FileDialog::Rename { .. } | FileDialog::Create { .. } => {
                     "enter confirm  esc cancel"
                 }
+                FileDialog::Provider { .. } => "enter save  esc cancel  up/down field",
             }
             .to_string();
         }
@@ -3141,6 +3853,9 @@ impl App {
                 "enter resume  d delete  r refresh  esc close"
             }
             .to_string();
+        }
+        if let Some(picker) = &self.picker {
+            return picker.footer.clone();
         }
         if self.context_menu.is_some() {
             return "up/down select  enter run  esc close".to_string();
@@ -3406,6 +4121,49 @@ impl App {
             }
             return;
         }
+        if self.picker.is_some() {
+            self.refresh_hover();
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let row = self
+                        .ui
+                        .picker_rows
+                        .iter()
+                        .find(|(rect, _)| inside(*rect, x, y))
+                        .map(|(_, index)| *index);
+                    if let Some(index) = row {
+                        let valid = self
+                            .picker
+                            .as_ref()
+                            .is_some_and(|picker| index < picker.items.len());
+                        if valid {
+                            if let Some(picker) = &mut self.picker {
+                                picker.selected = index;
+                                picker.touched = true;
+                            }
+                            self.apply_selected_picker_row();
+                        }
+                    } else if !inside(self.ui.picker, x, y) {
+                        self.picker = None;
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Some(picker) = &mut self.picker {
+                        picker.selected = picker.selected.saturating_sub(1);
+                        picker.touched = true;
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(picker) = &mut self.picker {
+                        picker.selected = (picker.selected + 1)
+                            .min(picker.items.len().saturating_sub(1));
+                        picker.touched = true;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.context_menu.is_some() {
             self.refresh_hover();
             match mouse.kind {
@@ -3657,6 +4415,21 @@ impl App {
             let over_row = self
                 .ui
                 .history_rows
+                .iter()
+                .any(|(rect, _)| inside(*rect, x, y));
+            self.set_pointer(if over_row {
+                PointerShape::Pointer
+            } else {
+                PointerShape::Default
+            });
+            return;
+        }
+
+        if self.picker.is_some() {
+            self.hover_edge = None;
+            let over_row = self
+                .ui
+                .picker_rows
                 .iter()
                 .any(|(rect, _)| inside(*rect, x, y));
             self.set_pointer(if over_row {
@@ -4143,6 +4916,186 @@ fn truncate(text: &str, width: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Pi's model list, in the order pi reported it. Entries without a provider
+/// or id are unusable for `set_model`, so they are dropped.
+fn model_list(models: &[Value]) -> Vec<ModelPref> {
+    models.iter().filter_map(ModelPref::from_value).collect()
+}
+
+fn model_position(models: &[ModelPref], current: Option<&ModelPref>) -> usize {
+    current
+        .and_then(|current| models.iter().position(|model| model == current))
+        .unwrap_or(0)
+}
+
+/// Where smol remembers the last model the user picked.
+/// Where smol keeps its small per-user state files (model preference,
+/// appended system prompt).
+pub(crate) fn config_file(name: &str) -> Option<PathBuf> {
+    if let Some(base) = env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(base).join("smol").join(name));
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("smol").join(name))
+}
+
+/// pi's agent directory, where `models.json` and the auth store live.
+fn agent_dir() -> PathBuf {
+    env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .or_else(|| env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".pi").join("agent"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".pi").join("agent"))
+}
+
+fn models_file() -> PathBuf {
+    agent_dir().join("models.json")
+}
+
+/// The configured providers, newest config first by id.
+fn read_providers(path: &Path) -> Result<Vec<ProviderPrefill>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))?;
+    let Some(providers) = value.get("providers").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    Ok(providers
+        .iter()
+        .map(|(id, entry)| ProviderPrefill::from_entry(id, entry))
+        .collect())
+}
+
+/// Merges the form into pi's `models.json`, leaving every other key and
+/// provider untouched. Existing files are never clobbered when they cannot be
+/// parsed.
+fn save_provider_to(path: &Path, fields: &[TextPrompt]) -> Result<String, String> {
+    let value = |index: usize| -> String {
+        fields
+            .get(index)
+            .map(|field| field.value.trim().to_string())
+            .unwrap_or_default()
+    };
+    let id = value(0);
+    let name = value(1);
+    let base_url = value(2);
+    let api_key = value(3);
+    let api = value(4);
+    let model_id = value(5);
+    let model_name = value(6);
+    let context = value(7);
+
+    if id.is_empty() {
+        return Err("provider id is required".to_string());
+    }
+    if !id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err("provider id may use letters, digits, - and _".to_string());
+    }
+    if base_url.is_empty() {
+        return Err("base url is required".to_string());
+    }
+    if model_id.is_empty() {
+        return Err("model id is required".to_string());
+    }
+
+    let mut root = match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<Value>(&text).map_err(|error| {
+            format!(
+                "{} is not valid JSON, refusing to overwrite it: {error}",
+                path.display()
+            )
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not a JSON object", path.display()))?;
+    let providers = object
+        .entry("providers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "providers is not an object".to_string())?;
+    let entry = providers
+        .entry(id.clone())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("provider {id} is not an object"))?;
+
+    entry.insert("name".to_string(), json!(if name.is_empty() { id.clone() } else { name }));
+    entry.insert("baseUrl".to_string(), json!(base_url));
+    if !api_key.is_empty() {
+        entry.insert("apiKey".to_string(), json!(api_key));
+    }
+    let api = if api.is_empty() {
+        "openai-completions".to_string()
+    } else {
+        api
+    };
+    entry.insert("api".to_string(), json!(api));
+
+    let models = entry
+        .entry("models")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| "models is not an array".to_string())?;
+    let existing = models
+        .iter()
+        .position(|model| model.get("id").and_then(Value::as_str) == Some(model_id.as_str()));
+    let mut model = existing
+        .and_then(|index| models.get(index).cloned())
+        .unwrap_or_else(|| json!({}));
+    model["id"] = json!(model_id);
+    if !model_name.is_empty() {
+        model["name"] = json!(model_name);
+    }
+    if let Ok(tokens) = context.parse::<u64>() {
+        model["contextWindow"] = json!(tokens);
+    }
+    match existing {
+        Some(index) => models[index] = model,
+        None => models.push(model),
+    }
+
+    let text = serde_json::to_string_pretty(&root)
+        .map_err(|error| format!("cannot serialize models.json: {error}"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    Ok(format!("provider {id} saved"))
+}
+
+fn load_model_pref(path: &Path) -> Option<ModelPref> {
+    let text = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    ModelPref::from_value(&value)
+}
+
+fn save_model_pref(path: &Path, pref: &ModelPref) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut data = json!({
+        "provider": pref.provider,
+        "id": pref.id,
+        "name": pref.name,
+    });
+    if let Some(context) = pref.context_window {
+        data["contextWindow"] = json!(context);
+    }
+    fs::write(path, serde_json::to_string_pretty(&data)?)
 }
 
 fn should_auto_compact(percent: u64, compacted: bool) -> bool {
@@ -4660,6 +5613,599 @@ mod tests {
         }));
         assert_eq!(app.models.len(), 2);
         assert!(app.agent.entries.is_empty());
+    }
+
+    fn model_pref(provider: &str, id: &str, name: &str) -> ModelPref {
+        ModelPref {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            name: name.to_string(),
+            context_window: None,
+        }
+    }
+
+    fn sample_models() -> Vec<Value> {
+        json!([
+            { "provider": "zai", "id": "glm-4.6", "name": "GLM 4.6" },
+            {
+                "provider": "anthropic",
+                "id": "claude-sonnet-4",
+                "name": "Claude Sonnet 4",
+                "contextWindow": 200000
+            },
+            { "provider": "openai", "id": "gpt-5", "name": "GPT-5" }
+        ])
+        .as_array()
+        .cloned()
+        .expect("models array")
+    }
+
+    /// A stand-in for `pi --mode rpc`: it logs every command it receives and
+    /// answers `set_model` the way pi does, with the full model object.
+    #[cfg(unix)]
+    fn fake_pi(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log = root.join("pi-rpc.log");
+        let script = root.join("fake-pi.sh");
+        let body = format!(
+            "#!/bin/sh\nLOG='{}'\necho \"ARGS: $@\" >> \"$LOG\"\n{}\n",
+            log.display(),
+            r#"while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  case "$line" in
+    *set_model*) printf '%s\n' '{"type":"response","command":"set_model","success":true,"data":{"provider":"anthropic","id":"claude-sonnet-4","name":"Claude Sonnet 4","contextWindow":200000}}' ;;
+  esac
+done"#
+        );
+        fs::write(&script, body).expect("write fake pi");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod fake pi");
+        script
+    }
+
+    /// Drains pi output until `check` passes, or gives up after ~3 seconds.
+    fn wait_until(app: &mut App, check: impl Fn(&App) -> bool) -> bool {
+        for _ in 0..300 {
+            app.drain_pi();
+            if check(app) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn model_pref_round_trips_through_disk() {
+        let root = temp_root("smol-model-pref");
+        let path = root.join("nested").join("model.json");
+        let pref = model_pref("anthropic", "claude-sonnet-4", "Claude Sonnet 4");
+        save_model_pref(&path, &pref).expect("save model");
+
+        let loaded = load_model_pref(&path).expect("load model");
+        assert_eq!(loaded.provider, "anthropic");
+        assert_eq!(loaded.id, "claude-sonnet-4");
+        assert_eq!(loaded.name, "Claude Sonnet 4");
+
+        fs::write(&path, "not json at all").expect("write garbage");
+        assert!(load_model_pref(&path).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn set_model_response_remembers_the_model() {
+        let root = temp_root("smol-model-remember");
+        let mut app = test_app();
+        app.model_pref_file = Some(root.join("model.json"));
+        app.model_pref = None;
+
+        app.on_response(&json!({
+            "type": "response",
+            "command": "set_model",
+            "success": true,
+            "data": {
+                "provider": "anthropic",
+                "id": "claude-sonnet-4",
+                "name": "Claude Sonnet 4"
+            }
+        }));
+
+        assert_eq!(app.model.as_deref(), Some("Claude Sonnet 4"));
+        let saved = load_model_pref(&root.join("model.json")).expect("saved model");
+        assert_eq!(saved.id, "claude-sonnet-4");
+        assert_eq!(app.model_current.as_ref(), Some(&saved));
+        assert_eq!(app.model_pref.as_ref(), Some(&saved));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_get_state_keeps_the_saved_model() {
+        let mut app = test_app();
+        let saved = model_pref("anthropic", "claude-sonnet-4", "Claude Sonnet 4");
+        app.model_pref = Some(saved.clone());
+
+        app.on_response(&json!({
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "data": {
+                "model": { "provider": "zai", "id": "glm-4.6", "name": "GLM 4.6" }
+            }
+        }));
+
+        // The pane follows whatever pi reports; the preference stays put.
+        assert_eq!(app.model.as_deref(), Some("GLM 4.6"));
+        assert_eq!(app.model_pref, Some(saved));
+    }
+
+    #[test]
+    fn switching_sessions_remembers_the_model_pi_restored() {
+        let root = temp_root("smol-model-switch");
+        let mut app = test_app();
+        app.model_pref_file = Some(root.join("model.json"));
+        app.model_pref = Some(model_pref("zai", "glm-4.6", "GLM 4.6"));
+        app.model_record_once = true;
+
+        app.on_response(&json!({
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "data": {
+                "model": { "provider": "openai", "id": "gpt-5", "name": "GPT-5" }
+            }
+        }));
+
+        let saved = load_model_pref(&root.join("model.json")).expect("saved model");
+        assert_eq!(saved.provider, "openai");
+        assert_eq!(saved.id, "gpt-5");
+        assert_eq!(app.model_pref.as_ref(), Some(&saved));
+        assert!(!app.model_record_once);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_opens_a_list_instead_of_asking_for_a_name() {
+        let mut app = test_app();
+        app.models = sample_models();
+        app.model_current = Some(model_pref("anthropic", "claude-sonnet-4", "Claude Sonnet 4"));
+
+        app.agent.input = "/model".to_string();
+        app.send_prompt();
+
+        let picker = app.picker.as_ref().expect("picker open");
+        assert_eq!(picker.items.len(), 3);
+        // The active model starts out under the cursor.
+        assert_eq!(picker.selected, 1);
+        assert!(app.status_hint(120).contains("enter switch"));
+    }
+
+    fn provider_form(values: [&str; 8]) -> Vec<TextPrompt> {
+        PROVIDER_LABELS
+            .iter()
+            .zip(values)
+            .map(|(label, value)| TextPrompt::new(*label, value))
+            .collect()
+    }
+
+    #[test]
+    fn saving_a_provider_keeps_the_rest_of_models_json() {
+        let root = temp_root("smol-provider-save");
+        let path = root.join("models.json");
+        fs::write(
+            &path,
+            json!({
+                "providers": {
+                    "other": {
+                        "baseUrl": "http://other/v1",
+                        "apiKey": "keep-me",
+                        "api": "openai-completions",
+                        "models": []
+                    }
+                },
+                "custom": 42
+            })
+            .to_string(),
+        )
+        .expect("seed models.json");
+
+        let fields = provider_form([
+            "newp",
+            "New Provider",
+            "http://127.0.0.1:9000/v1",
+            "secret",
+            "openai-completions",
+            "fast-model",
+            "Fast Model",
+            "65536",
+        ]);
+        let message = save_provider_to(&path, &fields).expect("save provider");
+        assert_eq!(message, "provider newp saved");
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).expect("read back"))
+            .expect("valid json");
+        assert_eq!(saved["custom"], 42, "unrelated keys survive");
+        assert_eq!(saved["providers"]["other"]["apiKey"], "keep-me");
+        let added = &saved["providers"]["newp"];
+        assert_eq!(added["name"], "New Provider");
+        assert_eq!(added["baseUrl"], "http://127.0.0.1:9000/v1");
+        assert_eq!(added["apiKey"], "secret");
+        assert_eq!(added["api"], "openai-completions");
+        assert_eq!(added["models"][0]["id"], "fast-model");
+        assert_eq!(added["models"][0]["name"], "Fast Model");
+        assert_eq!(added["models"][0]["contextWindow"], 65536);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saving_a_provider_updates_the_model_it_already_had() {
+        let root = temp_root("smol-provider-update");
+        let path = root.join("models.json");
+        fs::write(
+            &path,
+            json!({
+                "providers": {
+                    "home": {
+                        "baseUrl": "http://old/v1",
+                        "models": [{ "id": "qwen", "name": "Old name", "contextWindow": 1000 }]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("seed models.json");
+
+        let fields = provider_form([
+            "home",
+            "",
+            "http://new/v1",
+            "",
+            "",
+            "qwen",
+            "New name",
+            "262000",
+        ]);
+        save_provider_to(&path, &fields).expect("save provider");
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).expect("read back"))
+            .expect("valid json");
+        let entry = &saved["providers"]["home"];
+        assert_eq!(saved["providers"].as_object().expect("providers").len(), 1);
+        assert_eq!(entry["models"].as_array().expect("models").len(), 1);
+        assert_eq!(entry["models"][0]["name"], "New name");
+        assert_eq!(entry["models"][0]["contextWindow"], 262000);
+        assert_eq!(entry["baseUrl"], "http://new/v1");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saving_a_provider_refuses_broken_files_and_bad_input() {
+        let root = temp_root("smol-provider-guard");
+        let path = root.join("models.json");
+        fs::write(&path, "{ not json").expect("seed broken file");
+        let fields = provider_form(["newp", "", "http://x/v1", "", "", "m", "", ""]);
+        assert!(save_provider_to(&path, &fields).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            "{ not json",
+            "a broken file is never overwritten"
+        );
+
+        let missing_url = provider_form(["newp", "", "", "", "", "m", "", ""]);
+        assert_eq!(
+            save_provider_to(&path, &missing_url).unwrap_err(),
+            "base url is required"
+        );
+        let bad_id = provider_form(["has space", "", "http://x/v1", "", "", "m", "", ""]);
+        assert!(save_provider_to(&path, &bad_id).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_picker_prefills_the_form_from_models_json() {
+        let root = temp_root("smol-provider-pick");
+        let mut app = test_app();
+        app.models_file = root.join("models.json");
+        fs::write(
+            &app.models_file,
+            json!({
+                "providers": {
+                    "bbb": {
+                        "name": "Second",
+                        "baseUrl": "http://b/v1",
+                        "apiKey": "kb",
+                        "api": "openai-completions",
+                        "models": [{ "id": "mb", "name": "Model B", "contextWindow": 32768 }]
+                    },
+                    "aaa": {
+                        "name": "First",
+                        "baseUrl": "http://a/v1",
+                        "apiKey": "ka",
+                        "api": "openai-completions",
+                        "models": [{ "id": "ma", "name": "Model A", "contextWindow": 128000 }]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("seed models.json");
+
+        app.open_provider_picker();
+        let picker = app.picker.as_ref().expect("picker open");
+        assert_eq!(picker.items.len(), 3, "new provider plus two saved ones");
+        assert_eq!(picker.items[0].label, "new provider");
+        assert_eq!(picker.items[1].label, "First");
+        assert_eq!(picker.items[2].label, "Second");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.picker.is_none(), "the form replaces the picker");
+        let Some(FileDialog::Provider { fields, .. }) = &app.dialog else {
+            panic!("provider form open");
+        };
+        assert_eq!(fields[0].value, "aaa");
+        assert_eq!(fields[1].value, "First");
+        assert_eq!(fields[2].value, "http://a/v1");
+        assert_eq!(fields[3].value, "ka");
+        assert_eq!(fields[4].value, "openai-completions");
+        assert_eq!(fields[5].value, "ma");
+        assert_eq!(fields[6].value, "Model A");
+        assert_eq!(fields[7].value, "128000");
+        assert!(app.status_hint(120).contains("enter save"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_form_saves_and_closes() {
+        let root = temp_root("smol-provider-form");
+        let mut app = test_app();
+        app.models_file = root.join("models.json");
+        app.open_provider_form(ProviderPrefill {
+            api: "openai-completions".to_string(),
+            ..ProviderPrefill::default()
+        });
+
+        let values = [
+            "myprov",
+            "My Prov",
+            "http://127.0.0.1:8080/v1",
+            "secret",
+            "openai-completions",
+            "fast",
+            "Fast",
+            "65536",
+        ];
+        for value in values {
+            // Ctrl+U clears whatever the form was prefilled with.
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            for ch in value.chars() {
+                app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.dialog.is_none(), "the form closes on save");
+        let status = app
+            .status
+            .as_ref()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_default();
+        assert!(status.contains("provider myprov saved"), "got: {status}");
+
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(&app.models_file).expect("models.json written"),
+        )
+        .expect("valid json");
+        assert_eq!(
+            saved["providers"]["myprov"]["baseUrl"],
+            "http://127.0.0.1:8080/v1"
+        );
+        assert_eq!(saved["providers"]["myprov"]["models"][0]["id"], "fast");
+        assert_eq!(
+            saved["providers"]["myprov"]["models"][0]["contextWindow"],
+            65536
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn picker_keys_move_and_escape_closes() {
+        let mut app = test_app();
+        app.models = sample_models();
+        app.open_model_picker();
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.picker.as_ref().map(|picker| picker.selected), Some(2));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.picker.as_ref().map(|picker| picker.selected), Some(1));
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.picker.as_ref().map(|picker| picker.selected), Some(2));
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.picker.as_ref().map(|picker| picker.selected), Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn thinking_opens_a_list_and_sets_the_level() {
+        let mut app = test_app();
+        app.thinking_level = Some("medium".to_string());
+        app.thinking_levels = vec!["off", "low", "medium", "high"]
+            .iter()
+            .map(|level| level.to_string())
+            .collect();
+
+        app.agent.input = "/thinking".to_string();
+        app.send_prompt();
+
+        let picker = app.picker.as_ref().expect("picker open");
+        assert_eq!(picker.items.len(), 4);
+        assert_eq!(picker.selected, 2, "the current level starts selected");
+        assert!(picker.items[2].active);
+        assert!(app.status_hint(120).contains("enter set"));
+
+        // pi narrows the list to what this model supports.
+        app.on_response(&json!({
+            "type": "response",
+            "command": "get_available_thinking_levels",
+            "success": true,
+            "data": { "levels": ["off", "medium", "high"] }
+        }));
+        let picker = app.picker.as_ref().expect("picker open");
+        assert_eq!(picker.items.len(), 3);
+        assert_eq!(picker.selected, 1, "stays on the current level");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.picker.is_none());
+        assert_eq!(app.thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn thinking_level_follows_get_state() {
+        let mut app = test_app();
+        app.on_response(&json!({
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "data": { "thinkingLevel": "xhigh" }
+        }));
+        assert_eq!(app.thinking_level.as_deref(), Some("xhigh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn picking_a_model_sends_set_model_and_remembers_it() {
+        let root = temp_root("smol-model-picker-rpc");
+        let script = fake_pi(&root);
+        let mut app = test_app();
+        app.model_pref_file = Some(root.join("model.json"));
+        app.model_pref = None;
+        app.models = sample_models();
+        app.pi = PiState::Running(PiClient::spawn_with(&script, &root, &[]).expect("spawn fake pi"));
+
+        app.open_model_picker();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.picker.is_none(), "picker closes after choosing");
+
+        let log = root.join("pi-rpc.log");
+        let reached_pi = wait_until(&mut app, |_| {
+            fs::read_to_string(&log).unwrap_or_default().contains("set_model")
+        });
+        assert!(reached_pi, "set_model reaches pi");
+
+        let remembered = wait_until(&mut app, |app| app.model_pref.is_some());
+        assert!(remembered, "pi's answer is remembered");
+        let sent = fs::read_to_string(&log).unwrap_or_default();
+        assert!(sent.contains("\"modelId\":\"claude-sonnet-4\""), "got: {sent}");
+        let saved = load_model_pref(&root.join("model.json")).expect("saved model");
+        assert_eq!(saved.id, "claude-sonnet-4");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn todo_file_drives_the_panel_state() {
+        let root = temp_root("smol-todo");
+        let mut app = App::new(root.clone(), true);
+        let file = root.join(".smol").join("todo.md");
+        fs::create_dir_all(file.parent().expect("todo dir")).expect("mkdir");
+
+        fs::write(&file, "# plan\n[ ] first\n[>] second\n").expect("write todo");
+        app.tick();
+        assert_eq!(app.todo.tasks.len(), 2);
+        assert_eq!(app.todo.done(), 0);
+        assert_eq!(app.todo.active_index(), Some(1));
+
+        fs::write(&file, "[x] first\n[x] second\n").expect("finish todo");
+        app.refresh_todo();
+        assert_eq!(app.todo.done(), 2);
+
+        fs::remove_file(&file).expect("remove todo");
+        app.refresh_todo();
+        assert!(app.todo.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_starts_with_full_permissions_and_no_extensions() {
+        let root = temp_root("smol-pi-flags");
+        let script = fake_pi(&root);
+        let append = root.join("append.md");
+        fs::write(&append, "extra instructions").expect("write prompt");
+        let mut app = test_app();
+        app.pi_path = Some(script);
+        app.instructions = Some(append.clone());
+
+        app.start_pi(None);
+
+        let log = root.join("pi-rpc.log");
+        let started = wait_until(&mut app, |_| {
+            fs::read_to_string(&log).unwrap_or_default().contains("ARGS:")
+        });
+        assert!(started, "pi started");
+        let args = fs::read_to_string(&log).unwrap_or_default();
+        assert!(args.contains("--mode rpc"), "got: {args}");
+        assert!(args.contains("-a -ne -ns"), "got: {args}");
+        assert!(
+            args.contains(&format!("--append-system-prompt {}", append.display())),
+            "got: {args}"
+        );
+        assert!(!args.contains("-e "), "no extensions loaded: {args}");
+        assert!(!args.contains("--skill"), "no skills loaded: {args}");
+
+        // Restarting resumes the open session instead of losing it.
+        let session = root.join("session.jsonl");
+        fs::write(&session, "").expect("write session");
+        app.session_path = Some(session.clone());
+        app.restart_pi();
+        let resumed = wait_until(&mut app, |_| {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .matches("ARGS:")
+                .count()
+                >= 2
+        });
+        assert!(resumed, "pi restarted");
+        let args = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            args.contains(&format!("--session {}", session.display())),
+            "got: {args}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_session_reapplies_the_last_model() {
+        let root = temp_root("smol-model-new-session");
+        let script = fake_pi(&root);
+        let mut app = test_app();
+        app.model_pref_file = Some(root.join("model.json"));
+        app.model_pref = Some(model_pref("anthropic", "claude-sonnet-4", "Claude Sonnet 4"));
+        app.pi = PiState::Running(PiClient::spawn_with(&script, &root, &[]).expect("spawn fake pi"));
+
+        app.on_response(&json!({
+            "type": "response",
+            "command": "new_session",
+            "success": true
+        }));
+
+        let log = root.join("pi-rpc.log");
+        let reapplied = wait_until(&mut app, |_| {
+            fs::read_to_string(&log).unwrap_or_default().contains("set_model")
+        });
+        assert!(reapplied, "the saved model is re-sent for a fresh session");
+        let sent = fs::read_to_string(&log).unwrap_or_default();
+        assert!(sent.contains("\"modelId\":\"claude-sonnet-4\""), "got: {sent}");
+        let confirmed = wait_until(&mut app, |app| !app.model_auto_apply);
+        assert!(confirmed, "pi confirmed the automatic switch");
+        let saved = load_model_pref(&root.join("model.json")).expect("saved model");
+        assert_eq!(saved.id, "claude-sonnet-4");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

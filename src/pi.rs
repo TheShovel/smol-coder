@@ -22,9 +22,12 @@ pub struct PiClient {
 }
 
 impl PiClient {
-    pub fn spawn(pi: &Path, cwd: &Path) -> std::io::Result<Self> {
+    /// Spawns pi in RPC mode with extra arguments appended, so callers can
+    /// pass flags such as `--no-extensions` or `--session <path>`.
+    pub fn spawn_with(pi: &Path, cwd: &Path, extra: &[String]) -> std::io::Result<Self> {
         let mut child = Command::new(pi)
             .args(["--mode", "rpc"])
+            .args(extra)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -106,10 +109,6 @@ impl PiClient {
 
     pub fn abort(&mut self) -> std::io::Result<()> {
         self.send(json!({ "type": "abort" }))
-    }
-
-    pub fn get_state(&mut self) -> std::io::Result<()> {
-        self.send(json!({ "type": "get_state" }))
     }
 
     pub fn shutdown(&mut self) {
