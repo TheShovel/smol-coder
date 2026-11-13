@@ -3,6 +3,7 @@ mod editor;
 mod git;
 mod highlight;
 mod markdown;
+mod partial_json;
 mod pi;
 mod predict;
 mod prompt;

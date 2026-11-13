@@ -16,6 +16,7 @@ use ratatui::style::Style;
 use serde_json::{json, Value};
 
 use crate::editor::Editor;
+use crate::partial_json::partial_json;
 use crate::theme;
 use crate::git::Git;
 use crate::pi::{find_pi, PiClient, PiEvent};
@@ -959,6 +960,11 @@ pub struct App {
     model_pref_file: Option<PathBuf>,
     /// True while an automatic `set_model` (startup or new session) is in flight.
     model_auto_apply: bool,
+    /// True once pi answered `get_available_models` for the current process.
+    models_loaded: bool,
+    /// Set when the remembered model arrived before the model list did, so
+    /// applying it can wait for `get_available_models` instead of racing it.
+    model_pref_pending: bool,
     /// Persist the model reported by the next `get_state` (after a session switch).
     model_record_once: bool,
     pub picker: Option<ListPicker>,
@@ -1046,6 +1052,8 @@ impl App {
             model_pref,
             model_pref_file,
             model_auto_apply: false,
+            models_loaded: false,
+            model_pref_pending: false,
             model_record_once: false,
             picker: None,
             thinking_level: None,
@@ -1124,6 +1132,10 @@ impl App {
         if !matches!(self.pi, PiState::Running(_)) {
             return;
         }
+        // A fresh process starts with no model knowledge; the remembered
+        // model is applied from the `get_available_models` answer below.
+        self.models.clear();
+        self.models_loaded = false;
         self.send_rpc(json!({ "type": "get_state" }));
         self.send_rpc(json!({ "type": "get_commands" }));
         self.send_rpc(json!({ "type": "get_available_models" }));
@@ -1392,7 +1404,11 @@ impl App {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                self.models_loaded = true;
                 self.refresh_picker();
+                if std::mem::take(&mut self.model_pref_pending) {
+                    self.apply_model_pref();
+                }
             }
             "get_available_thinking_levels" => {
                 self.thinking_levels = value
@@ -2726,6 +2742,19 @@ impl App {
             return;
         };
         if !matches!(self.pi, PiState::Running(_)) {
+            return;
+        }
+        // pi only accepts a model it has listed, so wait for the list instead
+        // of racing it with a `set_model` that would fail and drop the pref.
+        if !self.models_loaded {
+            self.model_pref_pending = true;
+            return;
+        }
+        self.model_pref_pending = false;
+        if !self.models.is_empty() && !model_list(&self.models).contains(&pref) {
+            self.forget_model_pref();
+            self.agent
+                .note("saved model is unavailable, using pi's default");
             return;
         }
         self.model_auto_apply = true;
@@ -5012,191 +5041,6 @@ fn resolved_tool_path(args: &Value, root: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Parses the part of a JSON document that has arrived so far. A truncated
-/// string or container yields the partial value instead of failing, so tool
-/// arguments can be shown while the model is still writing them.
-fn partial_json(text: &str) -> Option<Value> {
-    let mut parser = PartialJson { text, pos: 0 };
-    parser.value()
-}
-
-struct PartialJson<'a> {
-    text: &'a str,
-    pos: usize,
-}
-
-impl PartialJson<'_> {
-    fn peek(&self) -> Option<char> {
-        self.text[self.pos..].chars().next()
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        let ch = self.peek()?;
-        self.pos += ch.len_utf8();
-        Some(ch)
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(ch) if ch.is_ascii_whitespace()) {
-            self.pos += 1;
-        }
-    }
-
-    fn value(&mut self) -> Option<Value> {
-        self.skip_ws();
-        match self.peek()? {
-            '{' => self.object(),
-            '[' => self.array(),
-            '"' => self.string().map(Value::String),
-            't' => self.literal("true", Value::Bool(true)),
-            'f' => self.literal("false", Value::Bool(false)),
-            'n' => self.literal("null", Value::Null),
-            _ => self.number(),
-        }
-    }
-
-    fn object(&mut self) -> Option<Value> {
-        self.bump();
-        let mut map = serde_json::Map::new();
-        loop {
-            self.skip_ws();
-            if self.peek() == Some('}') {
-                self.bump();
-                break;
-            }
-            if self.peek() != Some('"') {
-                break;
-            }
-            let Some(key) = self.string() else { break };
-            self.skip_ws();
-            if self.peek() != Some(':') {
-                break;
-            }
-            self.bump();
-            let Some(value) = self.value() else { break };
-            map.insert(key, value);
-            self.skip_ws();
-            match self.peek() {
-                Some(',') => {
-                    self.bump();
-                }
-                Some('}') => {
-                    self.bump();
-                    break;
-                }
-                _ => break,
-            }
-        }
-        Some(Value::Object(map))
-    }
-
-    fn array(&mut self) -> Option<Value> {
-        self.bump();
-        let mut items = Vec::new();
-        loop {
-            self.skip_ws();
-            if self.peek() == Some(']') {
-                self.bump();
-                break;
-            }
-            let Some(value) = self.value() else { break };
-            items.push(value);
-            self.skip_ws();
-            match self.peek() {
-                Some(',') => {
-                    self.bump();
-                }
-                Some(']') => {
-                    self.bump();
-                    break;
-                }
-                _ => break,
-            }
-        }
-        Some(Value::Array(items))
-    }
-
-    fn string(&mut self) -> Option<String> {
-        if self.peek() != Some('"') {
-            return None;
-        }
-        self.bump();
-        let mut out = String::new();
-        while let Some(ch) = self.bump() {
-            match ch {
-                '"' => return Some(out),
-                '\\' => {
-                    let Some(escape) = self.bump() else { break };
-                    match escape {
-                        '"' => out.push('"'),
-                        '\\' => out.push('\\'),
-                        '/' => out.push('/'),
-                        'b' => out.push('\u{8}'),
-                        'f' => out.push('\u{c}'),
-                        'n' => out.push('\n'),
-                        'r' => out.push('\r'),
-                        't' => out.push('\t'),
-                        'u' => {
-                            let mut code = 0u32;
-                            let mut complete = true;
-                            for _ in 0..4 {
-                                match self.bump().and_then(|ch| ch.to_digit(16)) {
-                                    Some(digit) => code = code * 16 + digit,
-                                    None => {
-                                        complete = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !complete {
-                                break;
-                            }
-                            if let Some(ch) = char::from_u32(code) {
-                                out.push(ch);
-                            }
-                        }
-                        other => out.push(other),
-                    }
-                }
-                other => out.push(other),
-            }
-        }
-        Some(out)
-    }
-
-    fn literal(&mut self, word: &str, value: Value) -> Option<Value> {
-        let rest = &self.text[self.pos..];
-        if rest.len() < word.len() && word.starts_with(rest) {
-            self.pos = self.text.len();
-            return Some(value);
-        }
-        if rest.starts_with(word) {
-            self.pos += word.len();
-            return Some(value);
-        }
-        None
-    }
-
-    fn number(&mut self) -> Option<Value> {
-        let start = self.pos;
-        while matches!(self.peek(), Some(ch) if ch.is_ascii_digit() || matches!(ch, '-' | '+' | '.' | 'e' | 'E'))
-        {
-            self.bump();
-        }
-        let raw = &self.text[start..self.pos];
-        if let Ok(number) = raw.parse::<i64>() {
-            return Some(Value::from(number));
-        }
-        if let Ok(number) = raw.parse::<u64>() {
-            return Some(Value::from(number));
-        }
-        raw.parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number)
-    }
-}
-
 fn tool_label(name: &str, args: &Value, path: Option<&Path>, root: &Path) -> String {
     let display = path
         .map(|path| display_path(path, root))
@@ -6028,19 +5872,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_json_keeps_unfinished_arguments() {
-        let value = partial_json(r#"{"path":"src/main.rs","content":"line one\nline "#)
-            .expect("partial value");
-        assert_eq!(value.get("path").and_then(Value::as_str), Some("src/main.rs"));
-        assert_eq!(value.get("content").and_then(Value::as_str), Some("line one\nline "));
-
-        let value = partial_json(r#"{"edits":[{"oldText":"a"},{"newText":"b"}],"n":3}"#)
-            .expect("value");
-        assert_eq!(value.pointer("/edits/1/newText").and_then(Value::as_str), Some("b"));
-        assert_eq!(value.get("n").and_then(Value::as_u64), Some(3));
-    }
-
-    #[test]
     fn tool_call_streams_into_a_live_entry() {
         let mut app = test_app();
         app.on_pi_record(json!({
@@ -6797,6 +6628,12 @@ done"#
         let mut app = test_app();
         app.model_pref_file = Some(root.join("model.json"));
         app.model_pref = Some(model_pref("anthropic", "claude-sonnet-4", "Claude Sonnet 4"));
+        app.models = vec![json!({
+            "provider": "anthropic",
+            "id": "claude-sonnet-4",
+            "name": "Claude Sonnet 4"
+        })];
+        app.models_loaded = true;
         app.pi = PiState::Running(PiClient::spawn_with(&script, &root, &[]).expect("spawn fake pi"));
 
         app.on_response(&json!({
@@ -6816,6 +6653,78 @@ done"#
         assert!(confirmed, "pi confirmed the automatic switch");
         let saved = load_model_pref(&root.join("model.json")).expect("saved model");
         assert_eq!(saved.id, "claude-sonnet-4");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_model_waits_for_the_model_list() {
+        let root = temp_root("smol-model-wait-list");
+        let script = fake_pi(&root);
+        let mut app = test_app();
+        app.model_pref = Some(model_pref("anthropic", "claude-sonnet-4", "Claude Sonnet 4"));
+        app.pi = PiState::Running(PiClient::spawn_with(&script, &root, &[]).expect("spawn fake pi"));
+
+        app.apply_model_pref();
+        assert!(
+            app.model_pref_pending,
+            "the saved model waits for get_available_models"
+        );
+        let log = root.join("pi-rpc.log");
+        assert!(
+            !fs::read_to_string(&log).unwrap_or_default().contains("set_model"),
+            "no set_model before the list arrives"
+        );
+
+        app.on_response(&json!({
+            "type": "response",
+            "command": "get_available_models",
+            "success": true,
+            "data": {
+                "models": [
+                    { "provider": "anthropic", "id": "claude-sonnet-4", "name": "Claude Sonnet 4" }
+                ]
+            }
+        }));
+        assert!(!app.model_pref_pending);
+        let applied = wait_until(&mut app, |_| {
+            fs::read_to_string(&log).unwrap_or_default().contains("set_model")
+        });
+        assert!(applied, "the saved model is applied once the list is in");
+        let sent = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            sent.contains("\"modelId\":\"claude-sonnet-4\""),
+            "got: {sent}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_model_missing_from_the_list_is_forgotten() {
+        let root = temp_root("smol-model-gone");
+        let script = fake_pi(&root);
+        let mut app = test_app();
+        app.model_pref_file = Some(root.join("model.json"));
+        app.model_pref = Some(model_pref("anthropic", "claude-sonnet-4", "Claude Sonnet 4"));
+        app.pi = PiState::Running(PiClient::spawn_with(&script, &root, &[]).expect("spawn fake pi"));
+        app.apply_model_pref();
+
+        app.on_response(&json!({
+            "type": "response",
+            "command": "get_available_models",
+            "success": true,
+            "data": {
+                "models": [
+                    { "provider": "openai", "id": "gpt-5", "name": "GPT-5" }
+                ]
+            }
+        }));
+
+        assert!(app.model_pref.is_none(), "a missing model is forgotten");
+        assert!(!fs::read_to_string(root.join("pi-rpc.log"))
+            .unwrap_or_default()
+            .contains("set_model"));
         let _ = fs::remove_dir_all(root);
     }
 
